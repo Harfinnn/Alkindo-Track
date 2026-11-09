@@ -1,0 +1,12 @@
+venv/
+__pycache__/
+*.pyc
+.git/
+dataset/
+debug_crops/
+logs/
+models/
+*.pt
+*.txt
+!requirements*.txt
+.cache/

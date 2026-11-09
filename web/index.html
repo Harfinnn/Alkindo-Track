@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Monitoring Gerbang</title>
+<style>
+  :root {
+    --bg: #e9edf1;
+    --panel: #f8fafb;
+    --ink: #16202a;
+    --muted: #5b6875;
+    --line: #cfd7de;
+    --in: #17794a;
+    --out: #a24b0b;
+    --ok: #17794a;
+    --idle: #4a5d70;
+    --bad: #b3261e;
+    --well: #101820;
+    font-family: "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink); }
+  header {
+    display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+    padding: 14px 24px; background: var(--panel); border-bottom: 1px solid var(--line);
+  }
+  h1 { margin: 0; font-size: 1.15rem; font-weight: 650; letter-spacing: .01em; margin-right: auto; }
+  .conn { display: flex; align-items: center; gap: 8px; font-size: .9rem; color: var(--muted); }
+  .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--idle); flex: none; }
+  .dot.ok { background: var(--ok); }
+  .dot.bad { background: var(--bad); }
+  #clock { font-variant-numeric: tabular-nums; font-size: .9rem; color: var(--muted); }
+
+  main {
+    display: grid; grid-template-columns: minmax(0, 1fr) 360px; gap: 20px;
+    padding: 20px 24px; max-width: 1680px; margin: 0 auto;
+  }
+  .well { background: var(--well); border-radius: 6px; aspect-ratio: 16 / 9; position: relative; overflow: hidden; }
+  .well img { width: 100%; height: 100%; object-fit: contain; display: block; }
+  .well .msg {
+    position: absolute; inset: 0; display: none; align-items: center; justify-content: center;
+    color: #d5dde5; text-align: center; padding: 24px; line-height: 1.5;
+  }
+  .well.down .msg { display: flex; }
+  .well.down img { visibility: hidden; }
+  .hint { margin: 10px 2px 0; color: var(--muted); font-size: .85rem; }
+
+  aside { display: flex; flex-direction: column; gap: 20px; }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 16px 18px; }
+  h2 { margin: 0 0 12px; font-size: 1rem; font-weight: 650; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { padding: 8px 0; text-align: right; font-variant-numeric: tabular-nums; }
+  th:first-child, td:first-child { text-align: left; }
+  th { font-weight: 500; font-size: .85rem; color: var(--muted); border-bottom: 1px solid var(--line); }
+  td { border-bottom: 1px solid #e3e8ec; }
+  tr:last-child td { border-bottom: 0; }
+  .big { font-size: 1.6rem; font-weight: 650; line-height: 1; }
+  .in { color: var(--in); }
+  .out { color: var(--out); }
+  .sub { font-size: .8rem; color: var(--muted); font-weight: 400; }
+
+  .cam { display: grid; grid-template-columns: 1fr auto; gap: 2px 12px; padding: 10px 0; border-bottom: 1px solid #e3e8ec; }
+  .cam:last-child { border-bottom: 0; padding-bottom: 0; }
+  .cam b { font-weight: 600; }
+  .pill { font-size: .8rem; font-weight: 600; padding: 2px 9px; border-radius: 999px; color: #fff; justify-self: end; }
+  .pill.AKTIF { background: var(--ok); }
+  .pill.IDLE { background: var(--idle); }
+  .pill.NOSIGNAL { background: var(--bad); }
+  .cam small { color: var(--muted); font-size: .82rem; grid-column: 1 / -1; }
+  .logbox { margin-top: 20px; }
+  .logwrap { max-height: 340px; overflow-y: auto; }
+  .logwrap table { font-size: .9rem; }
+  .logwrap th { position: sticky; top: 0; background: var(--panel); }
+  .logwrap th:nth-child(n+2), .logwrap td:nth-child(n+2) { text-align: left; padding-left: 12px; }
+  .tag { font-weight: 650; }
+  .tag.in { color: var(--in); }
+  .tag.out { color: var(--out); }
+  .empty { color: var(--muted); padding: 10px 0; }
+
+  @media (max-width: 1000px) {
+    main { grid-template-columns: 1fr; padding: 14px; }
+    header { padding: 12px 14px; }
+  }
+  @media (prefers-reduced-motion: no-preference) {
+    .dot { transition: background-color .3s; }
+  }
+  :focus-visible { outline: 3px solid #1f5fbf; outline-offset: 2px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Monitoring gerbang</h1>
+  <div class="conn"><span class="dot" id="dot"></span><span id="connText">Menghubungkan…</span></div>
+  <div id="clock"></div>
+</header>
+
+<main>
+  <div>
+    <div class="well" id="well">
+      <img id="stream" alt="Tampilan langsung 3 CCTV gerbang">
+      <div class="msg" id="msg">Video belum tersambung. Mencoba lagi otomatis.</div>
+    </div>
+    <p class="hint">Garis hitung dan ROI diatur dari aplikasi di laptop, lalu file konfigurasinya disalin ke server.</p>
+    <section class="logbox" aria-labelledby="h-log">
+      <h2 id="h-log">Log tracking (50 kejadian terbaru)</h2>
+      <div class="logwrap">
+        <table>
+          <thead><tr><th>Waktu</th><th>CCTV</th><th>Kelas</th><th>Arah</th><th>ID</th></tr></thead>
+          <tbody id="logs"></tbody>
+        </table>
+        <div class="empty" id="logEmpty" hidden>Belum ada kejadian hari ini.</div>
+      </div>
+    </section>
+  </div>
+
+  <aside>
+    <section aria-labelledby="h-occ">
+      <h2 id="h-occ">Okupansi</h2>
+      <table>
+        <thead><tr><th>Kelas</th><th>Di dalam PT</th><th>Di luar</th></tr></thead>
+        <tbody id="occ"></tbody>
+      </table>
+    </section>
+
+    <section aria-labelledby="h-cnt">
+      <h2 id="h-cnt">Hitungan hari ini (semua CCTV)</h2>
+      <table>
+        <thead><tr><th>Kelas</th><th>Masuk</th><th>Keluar</th></tr></thead>
+        <tbody id="cnt"></tbody>
+      </table>
+    </section>
+
+    <section aria-labelledby="h-cam">
+      <h2 id="h-cam">Kamera</h2>
+      <div id="cams"></div>
+    </section>
+  </aside>
+</main>
+
+<script>
+(function () {
+  var well = document.getElementById("well");
+  var img = document.getElementById("stream");
+  var dot = document.getElementById("dot");
+  var connText = document.getElementById("connText");
+
+  function cap(s) { return s.charAt(0) + s.slice(1).toLowerCase(); }
+  function el(tag, cls, text) {
+    var e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text !== undefined) e.textContent = text;
+    return e;
+  }
+
+  function startStream() {
+    img.src = "/stream?t=" + Date.now();
+  }
+  img.onload = function () { well.classList.remove("down"); };
+  img.onerror = function () {
+    well.classList.add("down");
+    setTimeout(startStream, 3000);
+  };
+  startStream();
+
+  function row(cells) {
+    var tr = document.createElement("tr");
+    cells.forEach(function (c) {
+      var td = el("td", c.cls, c.text);
+      tr.appendChild(td);
+    });
+    return tr;
+  }
+
+  function render(d) {
+    var occ = document.getElementById("occ");
+    occ.replaceChildren();
+    Object.keys(d.occupancy).forEach(function (k) {
+      var v = d.occupancy[k];
+      occ.appendChild(row([
+        { text: cap(k) },
+        { text: String(v.inside), cls: "big in" },
+        { text: String(v.outside), cls: "big out" }
+      ]));
+    });
+
+    var cnt = document.getElementById("cnt");
+    cnt.replaceChildren();
+    Object.keys(d.combined).forEach(function (k) {
+      var v = d.combined[k];
+      cnt.appendChild(row([
+        { text: cap(k) },
+        { text: String(v.in), cls: "in" },
+        { text: String(v.out), cls: "out" }
+      ]));
+    });
+
+    var cams = document.getElementById("cams");
+    cams.replaceChildren();
+    d.cameras.forEach(function (c) {
+      var box = el("div", "cam");
+      box.appendChild(el("b", "", "CCTV " + c.id + " – " + c.gate));
+      var state = c.state === "NO SIGNAL" ? "NOSIGNAL" : c.state;
+      box.appendChild(el("span", "pill " + state, c.state === "IDLE" ? "Sepi" : c.state === "AKTIF" ? "Aktif" : "Tidak ada sinyal"));
+      var info = "Kamera " + c.cam_fps + " FPS";
+      if (c.state === "AKTIF") info += " · AI " + c.ai_fps + " FPS (" + c.ai_ms + " ms)";
+      if (!c.line) info += " · garis belum diatur";
+      box.appendChild(el("small", "", info));
+      cams.appendChild(box);
+    });
+  }
+
+  function poll() {
+    fetch("/api/status", { cache: "no-store" })
+      .then(function (r) { if (!r.ok) throw new Error(r.status); return r.json(); })
+      .then(function (d) {
+        render(d);
+        dot.className = "dot ok";
+        connText.textContent = "Tersambung";
+      })
+      .catch(function () {
+        dot.className = "dot bad";
+        connText.textContent = "Server tidak terjangkau";
+      });
+  }
+  poll();
+  setInterval(poll, 2000);
+
+    function renderLogs(list) {
+    var tb = document.getElementById("logs");
+    tb.replaceChildren();
+    document.getElementById("logEmpty").hidden = list.length > 0;
+    list.forEach(function (e) {
+      var tr = document.createElement("tr");
+      var dir = e.direction === "in" ? "in" : "out";
+      tr.appendChild(el("td", "", e.time.split("T")[1] || e.time));
+      tr.appendChild(el("td", "", e.camera + " – " + e.gate));
+      tr.appendChild(el("td", "", cap(e.category)));
+      tr.appendChild(el("td", "tag " + dir, dir === "in" ? "MASUK" : "KELUAR"));
+      tr.appendChild(el("td", "", e.track_id));
+      tb.appendChild(tr);
+    });
+  }
+
+  function pollLogs() {
+    fetch("/api/logs?limit=50", { cache: "no-store" })
+      .then(function (r) { if (!r.ok) throw new Error(r.status); return r.json(); })
+      .then(renderLogs)
+      .catch(function () {});
+  }
+  pollLogs();
+  setInterval(pollLogs, 3000);
+
+  function tick() {
+    document.getElementById("clock").textContent =
+      new Date().toLocaleString("id-ID", { dateStyle: "full", timeStyle: "medium" });
+  }
+  tick();
+  setInterval(tick, 1000);
+})();
+</script>
+</body>
+</html>

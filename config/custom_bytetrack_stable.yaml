@@ -1,0 +1,21 @@
+# custom_bytetrack_stable.yaml
+# YOLO11l + OpenVINO + ByteTrack
+# People Tracking | 15 FPS | CPU
+
+tracker_type: bytetrack
+
+# Detection thresholds
+track_high_thresh: 0.25
+track_low_thresh: 0.10
+
+# New track creation
+new_track_thresh: 0.30
+
+# Lost track buffer
+track_buffer: 60
+
+# Matching
+match_thresh: 0.80
+
+# Score fusion
+fuse_score: True
