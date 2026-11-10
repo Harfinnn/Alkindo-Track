@@ -1,152 +1,338 @@
+import os
 
-from dataclasses import dataclass, field
+# Batasi thread CPU agar tidak terjadi oversubscription.
+os.environ["OMP_NUM_THREADS"] = "4"
+os.environ["OPENBLAS_NUM_THREADS"] = "4"
+os.environ["MKL_NUM_THREADS"] = "4"
+
+import time
+from dataclasses import dataclass
 from typing import Optional
 
 import cv2
 import numpy as np
+import torch
+import onnxruntime as ort
+
+from insightface.app import FaceAnalysis
+from insightface.utils import face_align
 
 
 @dataclass
-class DFFace:
+class FaceDetection:
     bbox: np.ndarray
     det_score: float
     kps: Optional[np.ndarray] = None
-    embedding: Optional[np.ndarray] = field(default=None, repr=False)
 
 
 class FaceEngine:
     """
-    Detektor + embedding DeepFace dalam satu panggilan.
-
-    model_name: ArcFace, SFace, Facenet512.
-    detector: yunet, retinaface, mtcnn.
+    InsightFace buffalo:
+    - Deteksi + 5 landmark : SCRFD
+    - Alignment            : norm_crop 112x112
+    - Embedding            : ArcFace w600k (512 dimensi)
     """
 
     def __init__(
         self,
-        det_size=None,
-        det_thresh=0.45,
-        num_threads=2,
-        model_name="ArcFace",
-        detector="yunet",
+        det_size=(320, 320),
+        det_thresh=0.35,
+        model_name="buffalo_l",
     ):
-        try:
-            import tensorflow as tf
+        self.det_size = tuple(det_size)
+        self.det_thresh = float(det_thresh)
+        self.model_name = model_name
 
-            tf.config.threading.set_intra_op_parallelism_threads(
-                int(num_threads)
+        self._app = None
+        self._det = None
+        self._rec = None
+
+        self._detect_count = 0
+        self._embedding_count = 0
+
+        self._load_models()
+
+    
+    # ---------------------------------------------------------
+    # LOAD MODEL
+    # ---------------------------------------------------------
+    
+    def _load_models(self):
+        print(f"[FACE] Memuat InsightFace {self.model_name}...")
+
+        try:
+            providers = [
+                "CUDAExecutionProvider",
+                "CPUExecutionProvider",
+            ]
+
+            app = FaceAnalysis(
+                name=self.model_name,
+                allowed_modules=["detection", "recognition"],
+                providers=providers,
             )
-            tf.config.threading.set_inter_op_parallelism_threads(1)
+
+            app.prepare(
+                ctx_id=0,
+                det_thresh=self.det_thresh,
+                det_size=self.det_size,
+            )
+
+            self._app = app
+            self._det = app.models["detection"]
+            self._rec = app.models["recognition"]
+
+            # Periksa provider yang benar-benar digunakan setiap model.
+            print("\n[FACE] Model execution providers:")
+
+            for name, model in app.models.items():
+                session = getattr(model, "session", None)
+
+                if session is not None:
+                    print(
+                        f"[FACE] {name}: "
+                        f"{session.get_providers()}"
+                    )
+
+            # Warm-up detection dan recognition.
+            dummy = np.zeros((320, 320, 3), dtype=np.uint8)
+            self._det.detect(dummy, max_num=0, metric="default")
+
+            dummy_face = np.zeros((112, 112, 3), dtype=np.uint8)
+            self._rec.get_feat(dummy_face)
+
+            print("\n[FACE] PyTorch CUDA:", torch.cuda.is_available())
+
+            if torch.cuda.is_available():
+                print(
+                    "[FACE] GPU:",
+                    torch.cuda.get_device_name(0)
+                )
+
+            print("[FACE] CUDA provider tersedia.")
+            print("[FACE] InsightFace siap.")
 
         except Exception as error:
-            print(f"[INFO] Batas thread TensorFlow tidak diterima: {error}")
+            self._app = None
+            self._det = None
+            self._rec = None
 
-        from deepface import DeepFace
+            raise RuntimeError(
+                f"Gagal menginisialisasi FaceEngine: {error}"
+            ) from error
 
-        self.DeepFace = DeepFace
-        self.model_name = model_name
-        self.detector = detector
-        self.det_thresh = det_thresh
-        self._warned = False
-
-        print(f"[INFO] Loading DeepFace ({model_name} + {detector})...")
-
-        self._represent(np.zeros((160, 160, 3), dtype=np.uint8))
-
-        print(f"[INFO] DeepFace ready | thresh={det_thresh}")
-
-    def _represent(self, image):
-        return self.DeepFace.represent(
-            img_path=image,
-            model_name=self.model_name,
-            detector_backend=self.detector,
-            enforce_detection=False,
-            align=True,
-        )
+    # ---------------------------------------------------------
+    # DETECTION
+    # ---------------------------------------------------------
 
     def detect(self, image):
+        """Deteksi wajah pada gambar BGR. Return list[FaceDetection]."""
+
+        if self._det is None:
+            return []
+
         if image is None or image.size == 0:
             return []
 
-        original_h, original_w = image.shape[:2]
-
-        scale = 1.0
-
-        # Upscale hanya untuk crop kecil.
-        if max(original_h, original_w) < 320:
-            scale = 2.0
-
-            detect_image = cv2.resize(
-                image,
-                None,
-                fx=scale,
-                fy=scale,
-                interpolation=cv2.INTER_CUBIC,
-            )
-        else:
-            detect_image = image
-
         try:
-            results = self._represent(detect_image)
+            start = time.perf_counter()
 
-        except Exception as error:
-            if not self._warned:
-                self._warned = True
-                print(f"[FACE ENGINE ERROR] {error}")
-            return []
+            bboxes, kpss = self._det.detect(image, max_num=0, metric="default")
 
-        faces = []
+            self._detect_count += 1
 
-        for r in results:
-            score = float(r.get("face_confidence") or 0.0)
-
-            if score < self.det_thresh:
-                continue
-
-            area = r["facial_area"]
-
-            x = int(area["x"] / scale)
-            y = int(area["y"] / scale)
-            w = int(area["w"] / scale)
-            h = int(area["h"] / scale)
-
-            kps = None
-
-            left = area.get("left_eye")
-            right = area.get("right_eye")
-            nose = area.get("nose")
-
-            if left is not None and right is not None and nose is not None:
-                kps = np.array(
-                    [
-                        [p[0] / scale, p[1] / scale]
-                        for p in (left, right, nose)
-                    ],
-                    dtype=np.float32,
+            if self._detect_count % 30 == 0:
+                print(
+                    f"[FACE PERF] Detection: "
+                    f"{(time.perf_counter() - start) * 1000:.2f} ms"
                 )
 
+            if bboxes is None or len(bboxes) == 0:
+                return []
+
+            faces = []
+
+            for index in range(len(bboxes)):
+                x1, y1, x2, y2, score = bboxes[index]
+
+                if x2 - x1 <= 1 or y2 - y1 <= 1:
+                    continue
+
+                kps = None
+
+                if kpss is not None:
+                    kps = np.asarray(kpss[index], dtype=np.float32)
+
+                faces.append(
+                    FaceDetection(
+                        bbox=np.array([x1, y1, x2, y2], dtype=np.float32),
+                        det_score=float(score),
+                        kps=kps,
+                    )
+                )
+
+            return faces
+
+        except Exception as error:
+            print(f"[FACE DETECT ERROR] {error}")
+            return []
+
+    # ---------------------------------------------------------
+    # EMBEDDING
+    # ---------------------------------------------------------
+
+    def get_embedding(self, image, face):
+        """Embedding 512-d (L2-normalized) dari wajah ter-align."""
+
+        if self._rec is None:
+            return None
+
+        if image is None or image.size == 0:
+            return None
+
+        # Tanpa landmark tidak bisa di-align; lebih baik dilewati.
+        if face.kps is None:
+            return None
+
+        try:
+            start = time.perf_counter()
+
+            aligned = face_align.norm_crop(image, landmark=face.kps, image_size=112)
+
             embedding = np.asarray(
-                r["embedding"],
-                dtype=np.float32,
-            )
+                self._rec.get_feat(aligned), dtype=np.float32
+            ).reshape(-1)
+
+            self._embedding_count += 1
+
+            if self._embedding_count % 30 == 0:
+                print(
+                    f"[FACE PERF] Embedding: "
+                    f"{(time.perf_counter() - start) * 1000:.2f} ms"
+                )
+
+            if embedding.shape != (512,):
+                print(
+                    "[FACE EMBEDDING ERROR] "
+                    f"Dimensi tidak sesuai: {embedding.shape}"
+                )
+                return None
 
             norm = np.linalg.norm(embedding)
 
-            faces.append(
-                DFFace(
-                    bbox=np.array(
-                        [x, y, x + w, y + h],
-                        dtype=np.float32,
-                    ),
-                    det_score=score,
-                    kps=kps,
-                    embedding=(
-                        embedding / norm if norm > 1e-12 else None
-                    ),
+            if norm <= 1e-10:
+                return None
+
+            return (embedding / norm).astype(np.float32)
+
+        except Exception as error:
+            print(f"[FACE EMBEDDING ERROR] {error}")
+            return None
+
+    
+    
+    # ---------------------------------------------------------
+    # BATCH EMBEDDING MULTI-ROI
+    # ---------------------------------------------------------
+
+    def get_embeddings_batch(self, face_items):
+        """
+        Batch embedding dari beberapa Person ROI.
+
+        face_items:
+            [(person_crop, face), ...]
+
+        Return:
+            List embedding 512 dimensi atau None.
+            Urutan hasil mengikuti face_items.
+        """
+
+        if not face_items:
+            return []
+
+        results = [None] * len(face_items)
+        aligned_faces = []
+        valid_indices = []
+
+        if self._rec is None:
+            return results
+
+        try:
+            start = time.perf_counter()
+
+            # 1. Alignment masing-masing wajah.
+            for index, (image, face) in enumerate(face_items):
+
+                if image is None or image.size == 0:
+                    continue
+
+                if face is None or face.kps is None:
+                    continue
+
+                aligned = face_align.norm_crop(
+                    image,
+                    landmark=face.kps,
+                    image_size=112,
                 )
+
+                aligned_faces.append(aligned)
+                valid_indices.append(index)
+
+            if not aligned_faces:
+                return results
+
+            # 2. Satu pemanggilan ArcFace untuk seluruh wajah.
+            features = np.asarray(
+                self._rec.get_feat(aligned_faces),
+                dtype=np.float32,
             )
 
-        return faces
+            features = features.reshape(-1, 512)
 
-    def get_embedding(self, image, face):
-        return face.embedding
+            if len(features) != len(valid_indices):
+                raise ValueError(
+                    f"Jumlah output tidak sesuai: "
+                    f"{len(features)} != {len(valid_indices)}"
+                )
+
+            # 3. Normalisasi setiap embedding.
+            norms = np.linalg.norm(
+                features,
+                axis=1,
+                keepdims=True,
+            )
+
+            features /= np.maximum(norms, 1e-12)
+
+            for index, embedding in zip(valid_indices, features):
+
+                if np.linalg.norm(embedding) <= 1e-10:
+                    continue
+
+                results[index] = embedding.astype(np.float32)
+
+            self._embedding_count += len(valid_indices)
+
+            elapsed = (time.perf_counter() - start) * 1000
+
+            print(
+                f"[FACE PERF] Batch embedding: "
+                f"{len(valid_indices)} wajah | "
+                f"{elapsed:.2f} ms"
+            )
+
+            return results
+
+        except Exception as error:
+            print(f"[FACE BATCH ERROR] {error}")
+            return results
+    
+    # ---------------------------------------------------------
+    # CLEANUP
+    # ---------------------------------------------------------
+
+    def close(self):
+        self._app = None
+        self._det = None
+        self._rec = None
+        print("[FACE] FaceEngine resources released.")

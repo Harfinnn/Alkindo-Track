@@ -23,12 +23,17 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import quote, urlparse, parse_qs
 
 import cv2
 import numpy as np
 import torch
 from ultralytics import YOLO
 
+from ultralytics import YOLO
+from ultralytics.trackers.byte_tracker import BYTETracker
+from ultralytics.utils import YAML, IterableSimpleNamespace
+from ultralytics.utils.checks import check_yaml
 
 # =========================================================
 # 1. KONFIGURASI 3 CCTV
@@ -107,7 +112,7 @@ USE_FP16 = True
 # Perangkat inferensi OpenVINO: "intel:gpu" (iGPU), "intel:cpu", atau None
 # (otomatis). Kalau gagal dimuat, script otomatis fallback ke pilihan otomatis.
 # INFER_DEVICE = "intel:gpu"
-INFER_DEVICE = os.getenv("INFER_DEVICE", "intel:cpu") or None
+INFER_DEVICE = os.getenv("INFER_DEVICE", "intel:gpu") or None
 
 # Paksa software decoding untuk RTSP.
 # OpenVINO tetap menggunakan Intel GPU untuk inferensi YOLO.
@@ -162,7 +167,7 @@ TRACKER_CONFIG = str(BASE_DIR / "config" / "custom_bytetrack_stable.yaml")
 
 # --- Frekuensi ---
 MAX_INFERENCE_FPS = 10
-UI_FPS = 30
+UI_FPS = 15
 
 # --- Motion gating ---
 # Saat gerbang sepi (tidak ada gerakan dan tidak ada objek terlacak),
@@ -215,12 +220,15 @@ SHOW_CONTROL_BAR = True  # Tekan H untuk hide/show bar kontrol
 # Garis hitung harus sudah diatur lebih dulu (jalankan mode biasa, tekan C).
 HEADLESS = False
 VIEWER_PORT = int(os.getenv("VIEWER_PORT", "0"))  # 0 = viewer mati
-VIEWER_FPS = 5
+VIEWER_FPS = 10
 
 # Interval cetak status ke terminal saat headless (detik)
 STATUS_INTERVAL_SECONDS = 30
 
 stop_event = threading.Event()
+
+# Thread inferensi bersama untuk seluruh CCTV
+inference_thread = None
 
 INFER_LOCK = threading.Lock()
 LOG_LOCK = threading.Lock()
@@ -384,6 +392,14 @@ def reset_tracker(model):
         except Exception as exc:
             print(f"Gagal reset tracker: {exc}")
 
+def create_camera_tracker():
+    """Membuat instance ByteTrack khusus untuk satu kamera."""
+
+    tracker_config = YAML.load(check_yaml(TRACKER_CONFIG))
+
+    tracker_args = IterableSimpleNamespace(**tracker_config.copy())
+
+    return BYTETracker(tracker_args)
 
 def motion_gray(frame):
     """Gambar abu-abu kecil untuk deteksi gerakan."""
@@ -637,9 +653,8 @@ class CameraState:
             target=self.camera_reader, daemon=True
         )
 
-        self.worker_thread = threading.Thread(
-            target=self.inference_worker, daemon=True
-        )
+        # Tracker ByteTrack khusus untuk kamera ini.
+        self.tracker = None
 
     # =====================================================
     # 4. KONFIGURASI GARIS (disimpan sebagai rasio 0-1)
@@ -1135,222 +1150,7 @@ class CameraState:
     # 8. THREAD YOLO + BYTETRACK
     # =====================================================
 
-    def inference_worker(self):
-
-        try:
-
-            model = YOLO(self.model_path, task="detect")
-
-        except Exception as exc:
-
-            print(
-                f"[CCTV {self.camera_id}] "
-                f"Gagal memuat model: {exc}"
-            )
-
-            return
-
-        track_kwargs = dict(
-            persist=True,
-            tracker=TRACKER_CONFIG,
-            imgsz=IMGSZ,
-            conf=CONF,
-            max_det=MAX_DET,
-            classes=self.detection_classes,
-            verbose=False,
-        )
-
-        if self.backend == "pt":
-            track_kwargs["device"] = "cpu"
-
-        elif INFER_DEVICE:
-
-            # Uji sekali (sekaligus warm-up). Kalau perangkat tidak didukung
-            # versi Ultralytics/OpenVINO ini, jatuh ke pilihan otomatis.
-            try:
-
-                with INFER_LOCK:
-
-                    model.predict(
-                        np.zeros((IMGSZ[0], IMGSZ[1], 3), dtype=np.uint8),
-                        imgsz=IMGSZ,
-                        device=INFER_DEVICE,
-                        verbose=False,
-                    )
-
-                track_kwargs["device"] = INFER_DEVICE
-
-                print(
-                    f"[CCTV {self.camera_id}] "
-                    f"Inferensi di {INFER_DEVICE}."
-                )
-
-            except Exception as exc:
-
-                print(
-                    f"[CCTV {self.camera_id}] "
-                    f"Perangkat {INFER_DEVICE} gagal ({exc}); "
-                    f"memakai pilihan otomatis."
-                )
-
-                # Muat ulang agar predictor bersih dari percobaan yang gagal.
-                model = YOLO(self.model_path, task="detect")
-
-        guard = INFER_LOCK if SERIALIZE_INFERENCE else nullcontext()
-
-        last_processed_id = -1
-        last_inference_start = 0.0
-        interval = 1.0 / max(1, MAX_INFERENCE_FPS)
-
-        prev_gray = None
-        last_motion = time.monotonic()
-        last_infer_time = 0.0
-        last_roi_version = -1
-
-        print(
-            f"[CCTV {self.camera_id}] "
-            f"YOLO + ByteTrack aktif ({self.backend})."
-        )
-
-        while not stop_event.is_set():
-
-            with self.frame_lock:
-
-                frame = self.latest_frame
-                hires = self.latest_hires
-                current_id = self.frame_id
-
-            if frame is None or current_id == last_processed_id:
-
-                time.sleep(0.01)
-                continue
-
-            # Batasi frekuensi
-            wait = interval - (
-                time.perf_counter() - last_inference_start
-            )
-
-            if wait > 0:
-
-                time.sleep(wait)
-
-                with self.frame_lock:
-
-                    frame = self.latest_frame
-                    hires = self.latest_hires
-                    current_id = self.frame_id
-
-            last_processed_id = current_id
-            last_inference_start = time.perf_counter()
-
-            # ---- ROI: hanya area ini yang diproses ----
-            with self.state_lock:
-
-                roi = self.roi
-                roi_version = self.roi_version
-
-            if roi_version != last_roi_version:
-
-                # ROI berubah: koordinat tracker tidak berlaku lagi
-                last_roi_version = roi_version
-                prev_gray = None
-                reset_tracker(model)
-                self.clear_tracking()
-
-            # Skala panel (640x360) -> frame asli. ROI/garis tetap di
-            # koordinat panel; hanya crop untuk YOLO yang diambil dari asli.
-            sx = hires.shape[1] / PANEL_WIDTH
-            sy = hires.shape[0] / PANEL_HEIGHT
-
-            if roi:
-
-                rx1, ry1, rx2, ry2 = roi
-                motion_src = frame[ry1:ry2, rx1:rx2]
-                region = np.ascontiguousarray(
-                    hires[
-                        int(ry1 * sy):int(ry2 * sy),
-                        int(rx1 * sx):int(rx2 * sx)
-                    ]
-                )
-
-            else:
-
-                rx1 = ry1 = 0
-                motion_src = frame
-                region = hires
-
-            # ---- Motion gating ----
-            if MOTION_GATING:
-
-                gray = motion_gray(motion_src)
-                now = time.monotonic()
-
-                moving = (
-                    prev_gray is None
-                    or has_motion(prev_gray, gray)
-                )
-
-                prev_gray = gray
-
-                if moving:
-                    last_motion = now
-
-                with self.state_lock:
-                    active = len(self.latest_tracks) > 0
-
-                skip = (
-                    not moving
-                    and not active
-                    and now - last_motion > MOTION_HOLD_SECONDS
-                    and now - last_infer_time < IDLE_HEARTBEAT_SECONDS
-                )
-
-                self.idle = skip
-
-                if skip:
-                    continue
-
-                last_infer_time = now
-
-            try:
-
-                start = time.perf_counter()
-
-                with guard:
-
-                    results = model.track(
-                        source=region, **track_kwargs
-                    )
-
-                # Update tracking + hitungan di thread ini
-                self.process_tracks(results[0], rx1, ry1, sx, sy)
-
-                self.inference_ms = (
-                    time.perf_counter() - start
-                ) * 1000
-
-                self._inference_frames += 1
-                now_p = time.perf_counter()
-                elapsed = now_p - self._last_inference_time
-
-                if elapsed >= 1:
-
-                    self.inference_fps = (
-                        self._inference_frames / elapsed
-                    )
-
-                    self._inference_frames = 0
-                    self._last_inference_time = now_p
-
-            except Exception as exc:
-
-                print(
-                    f"[CCTV {self.camera_id}] ERROR YOLO: {exc}"
-                )
-
-                time.sleep(0.1)
-
-        print(f"[CCTV {self.camera_id}] Thread inferensi berhenti.")
+    
 
     # =====================================================
     # 9. PROSES TRACK + PENGHITUNGAN (dipanggil worker)
@@ -1370,26 +1170,23 @@ class CameraState:
             self.track_last_seen.clear()
             self.latest_tracks = []
 
-    def process_tracks(self, result, off_x=0, off_y=0, sx=1.0, sy=1.0):
+    def process_tracks(self, tracked_rows, off_x=0, off_y=0, sx=1.0, sy=1.0):
         """Koordinat box relatif ke region (ROI); off_x/off_y = geser ke panel."""
 
         tracks = []
         now = time.monotonic()
 
-        boxes = result.boxes
-
         has_tracks = (
-            boxes is not None
-            and boxes.id is not None
-            and boxes.cls is not None
+            tracked_rows is not None
+            and len(tracked_rows) > 0
         )
 
         if has_tracks:
 
-            xyxy = boxes.xyxy.cpu().numpy()
-            ids = boxes.id.cpu().numpy().astype(int)
-            cls = boxes.cls.cpu().numpy().astype(int)
-            confs = boxes.conf.cpu().numpy()
+            xyxy = tracked_rows[:, 0:4]
+            ids = tracked_rows[:, 4].astype(int)
+            confs = tracked_rows[:, 5]
+            cls = tracked_rows[:, 6].astype(int)
 
         with self.state_lock:
 
@@ -2075,7 +1872,9 @@ def mouse_callback(event, x, y, flags, param):
 
 WEB_DIR = BASE_DIR / "web"
 _latest_jpeg = None
-_jpeg_lock = threading.Lock()
+_jpeg_seq = 0
+_jpeg_cond = threading.Condition()
+_viewer_clients = 0
 
 
 def render_canvas():
@@ -2138,13 +1937,50 @@ def build_status():
         },
     }
 
+def read_recent_logs(limit=50):
+    """Ambil kejadian crossing terbaru dari CSV hari ini (terbaru di atas)."""
+
+    limit = max(1, min(limit, 500))
+    path = current_log_path()
+    rows = deque(maxlen=limit)
+
+    with LOG_LOCK:
+        try:
+            with open(path, "r", newline="", encoding="utf-8") as f:
+                for r in csv.DictReader(f):
+                    rows.append(r)
+        except FileNotFoundError:
+            return []
+        except OSError as exc:
+            print(f"Gagal membaca log: {exc}")
+            return []
+
+    out = []
+    for r in reversed(rows):
+        try:
+            cam = int(r["camera"])
+        except (KeyError, ValueError, TypeError):
+            continue
+        out.append({
+            "time": r.get("timestamp", ""),
+            "camera": cam,
+            "gate": GATE_LABELS.get(cam, ""),
+            "category": r.get("category", ""),
+            "direction": r.get("direction", ""),
+            "track_id": r.get("track_id", ""),
+        })
+    return out
 
 def viewer_loop():
 
-    global _latest_jpeg
+    global _latest_jpeg, _jpeg_seq
     interval = 1.0 / VIEWER_FPS
 
     while not stop_event.is_set():
+
+        if _viewer_clients <= 0:
+            stop_event.wait(0.3)
+            continue
 
         t0 = time.perf_counter()
 
@@ -2153,8 +1989,10 @@ def viewer_loop():
         )
 
         if ok:
-            with _jpeg_lock:
+            with _jpeg_cond:
                 _latest_jpeg = buf.tobytes()
+                _jpeg_seq += 1
+                _jpeg_cond.notify_all()
 
         stop_event.wait(max(0.01, interval - (time.perf_counter() - t0)))
 
@@ -2184,6 +2022,18 @@ class ViewerHandler(BaseHTTPRequestHandler):
             )
             return
 
+        if path == "/api/logs":
+            qs = parse_qs(urlparse(self.path).query)
+            try:
+                limit = int(qs.get("limit", ["50"])[0])
+            except ValueError:
+                limit = 50
+            self._send(
+                200, "application/json",
+                json.dumps(read_recent_logs(limit)).encode("utf-8")
+            )
+            return
+
         if path == "/stream":
             self._stream()
             return
@@ -2206,6 +2056,8 @@ class ViewerHandler(BaseHTTPRequestHandler):
 
     def _stream(self):
 
+        global _viewer_clients
+
         self.send_response(200)
         self.send_header(
             "Content-Type", "multipart/x-mixed-replace; boundary=frame"
@@ -2213,24 +2065,36 @@ class ViewerHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
 
+        with _jpeg_cond:
+            _viewer_clients += 1
+            last_seq = _jpeg_seq
+
         try:
 
             while not stop_event.is_set():
 
-                with _jpeg_lock:
+                with _jpeg_cond:
+                    _jpeg_cond.wait_for(
+                        lambda: _jpeg_seq != last_seq or stop_event.is_set(),
+                        timeout=2
+                    )
+                    if _jpeg_seq == last_seq:
+                        continue
+                    last_seq = _jpeg_seq
                     jpg = _latest_jpeg
 
-                if jpg:
-                    self.wfile.write(
-                        b"--frame\r\nContent-Type: image/jpeg\r\n"
-                        b"Content-Length: " + str(len(jpg)).encode()
-                        + b"\r\n\r\n" + jpg + b"\r\n"
-                    )
+                self.wfile.write(
+                    b"--frame\r\nContent-Type: image/jpeg\r\n"
+                    b"Content-Length: " + str(len(jpg)).encode()
+                    + b"\r\n\r\n" + jpg + b"\r\n"
+                )
 
-                time.sleep(1.0 / VIEWER_FPS)
-
-        except (BrokenPipeError, ConnectionResetError):
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
             pass
+
+        finally:
+            with _jpeg_cond:
+                _viewer_clients -= 1
 
 
 def start_viewer():
@@ -2252,10 +2116,16 @@ def shutdown_threads():
 
     stop_event.set()
 
+    # Hentikan semua reader CCTV
     for cam in cameras.values():
+        if cam.reader_thread.is_alive():
+            cam.reader_thread.join(timeout=2)
 
-        cam.reader_thread.join(timeout=2)
-        cam.worker_thread.join(timeout=2)
+    # Hentikan shared inference thread
+    global inference_thread
+
+    if inference_thread is not None and inference_thread.is_alive():
+        inference_thread.join(timeout=5)
 
     print("Aplikasi Dual CCTV dihentikan.")
 
@@ -2356,11 +2226,284 @@ def run_headless():
 
         print("\nDihentikan oleh pengguna (Ctrl+C).")
 
+def shared_inference_worker(model_path, backend):
+    """
+    Satu model YOLO untuk seluruh CCTV.
+    Setiap CCTV memiliki instance ByteTrack masing-masing.
+    """
+    print("[SHARED] Memulai shared inference worker...")
+
+    # 1. Load satu model YOLO
+    try:
+        model = YOLO(model_path, task="detect")
+        print(f"[SHARED] Model dimuat: {model_path}")
+    except Exception as e:
+        print(f"[SHARED] Gagal memuat model: {e}")
+        return
+
+    # 2. Buat tracker independen untuk setiap kamera
+    try:
+        for cam_id, cam in cameras.items():
+            cam.tracker = create_camera_tracker()
+
+            print(f"[CCTV {cam_id}] ByteTrack berhasil dibuat")
+
+    except Exception as e:
+        print(f"[SHARED] Gagal membuat tracker: {e}")
+        return
+
+    # 3. Konfigurasi device
+    device_kwargs = {}
+
+    if backend == "pt":
+        device_kwargs["device"] = "cpu"
+    elif INFER_DEVICE:
+        device_kwargs["device"] = INFER_DEVICE
+
+    # 4. Warm-up model
+    try:
+        dummy = np.zeros(
+            (IMGSZ[0], IMGSZ[1], 3),
+            dtype=np.uint8
+        )
+
+        model.predict(
+            source=dummy,
+            imgsz=IMGSZ,
+            verbose=False,
+            **device_kwargs
+        )
+
+        print(f"[SHARED] Warm-up berhasil: {device_kwargs}")
+
+    except Exception as e:
+        print(f"[SHARED] Warm-up gagal: {e}")
+
+        if backend == "openvino":
+            print("[SHARED] Mencoba ulang tanpa device eksplisit...")
+            device_kwargs = {}
+
+            try:
+                model.predict(
+                    source=dummy,
+                    imgsz=IMGSZ,
+                    verbose=False
+                )
+                print("[SHARED] Warm-up fallback berhasil")
+            except Exception as fallback_error:
+                print(f"[SHARED] Fallback gagal: {fallback_error}")
+                return
+        else:
+            return
+
+    # 5. State independen setiap kamera
+    camera_states = {}
+
+    for cam_id in cameras:
+        camera_states[cam_id] = {
+            "last_processed_id": -1,
+            "last_inference_start": 0.0,
+            "prev_gray": None,
+            "last_motion": time.monotonic(),
+            "last_infer_time": 0.0,
+            "last_roi_version": -1,
+            "interval": 1.0 / max(1, MAX_INFERENCE_FPS),
+            "inference_frames": 0,
+            "last_inference_time": time.perf_counter(),
+        }
+
+    print("[SHARED] Semua CCTV siap diinferensi")
+
+    # 6. Loop inferensi seluruh kamera
+    while not stop_event.is_set():
+
+        processed_any = False
+
+        for cam_id, cam in cameras.items():
+
+            if stop_event.is_set():
+                break
+
+            state = camera_states[cam_id]
+            now = time.monotonic()
+
+            # Batasi FPS setiap kamera
+            if now - state["last_inference_start"] < state["interval"]:
+                continue
+
+            # Ambil frame terbaru
+            with cam.frame_lock:
+                frame = cam.latest_frame
+                hires = cam.latest_hires
+                current_id = cam.frame_id
+
+            if frame is None or hires is None:
+                continue
+
+            # Jangan proses frame yang sama berulang kali
+            if current_id == state["last_processed_id"]:
+                continue
+
+            state["last_processed_id"] = current_id
+            state["last_inference_start"] = now
+
+            # Ambil konfigurasi ROI
+            with cam.state_lock:
+                roi = cam.roi
+                roi_version = cam.roi_version
+
+            # Reset tracker jika ROI berubah
+            if roi_version != state["last_roi_version"]:
+
+                if cam.tracker is not None:
+                    cam.tracker.reset()
+
+                cam.clear_tracking()
+
+                state["prev_gray"] = None
+                state["last_roi_version"] = roi_version
+
+                print(f"[CCTV {cam_id}] ROI berubah, tracker di-reset")
+
+            # Skala koordinat frame
+            sx = hires.shape[1] / PANEL_WIDTH
+            sy = hires.shape[0] / PANEL_HEIGHT
+
+            # Crop ROI
+            if roi:
+                rx1, ry1, rx2, ry2 = roi
+
+                motion_src = frame[ry1:ry2, rx1:rx2]
+
+                region = hires[
+                    int(ry1 * sy):int(ry2 * sy),
+                    int(rx1 * sx):int(rx2 * sx)
+                ]
+            else:
+                rx1 = 0
+                ry1 = 0
+
+                motion_src = frame
+                region = hires
+
+            if region.size == 0 or motion_src.size == 0:
+                continue
+
+            region = np.ascontiguousarray(region)
+
+            # Motion gating
+            if MOTION_GATING:
+
+                gray = motion_gray(motion_src)
+
+                moving = (
+                    state["prev_gray"] is None
+                    or has_motion(state["prev_gray"], gray)
+                )
+
+                state["prev_gray"] = gray
+
+                with cam.state_lock:
+                    active = len(cam.latest_tracks) > 0
+
+                if moving:
+                    state["last_motion"] = now
+
+                skip = (
+                    not moving
+                    and not active
+                    and now - state["last_motion"] > MOTION_HOLD_SECONDS
+                    and now - state["last_infer_time"] < IDLE_HEARTBEAT_SECONDS
+                )
+
+                cam.idle = skip
+
+                if skip:
+                    continue
+
+            state["last_infer_time"] = now
+
+            # Inferensi YOLO
+            inference_start = time.perf_counter()
+
+            try:
+                if SERIALIZE_INFERENCE:
+                    with INFER_LOCK:
+                        results = model.predict(
+                            source=region,
+                            imgsz=IMGSZ,
+                            conf=CONF,
+                            max_det=MAX_DET,
+                            classes=cam.detection_classes,
+                            verbose=False,
+                            **device_kwargs
+                        )
+                else:
+                    results = model.predict(
+                        source=region,
+                        imgsz=IMGSZ,
+                        conf=CONF,
+                        max_det=MAX_DET,
+                        classes=cam.detection_classes,
+                        verbose=False,
+                        **device_kwargs
+                    )
+
+                # Konversi hasil deteksi
+                detections = results[0].boxes.cpu().numpy()
+
+                # Update ByteTrack khusus kamera ini
+                tracked_rows = cam.tracker.update(
+                    detections,
+                    region
+                )
+
+                # Kirim hasil tracking ke fungsi kamera
+                cam.process_tracks(
+                    tracked_rows,
+                    rx1,
+                    ry1,
+                    sx,
+                    sy
+                )
+
+                processed_any = True
+
+                # Statistik inferensi
+                inference_end = time.perf_counter()
+
+                cam.inference_ms = (
+                    inference_end - inference_start
+                ) * 1000
+
+                state["inference_frames"] += 1
+
+                elapsed = (
+                    inference_end - state["last_inference_time"]
+                )
+
+                if elapsed >= 1.0:
+                    cam.inference_fps = (
+                        state["inference_frames"] / elapsed
+                    )
+
+                    state["inference_frames"] = 0
+                    state["last_inference_time"] = inference_end
+
+            except Exception as e:
+                print(f"[CCTV {cam_id}] ERROR YOLO: {e}")
+                time.sleep(0.05)
+
+        if not processed_any:
+            time.sleep(0.005)
+
+    print("[SHARED] Shared inference worker berhenti")
 
 def main():
 
     global SHOW_PERFORMANCE_STATS, SHOW_CONTROL_BAR
     global active_camera_id, correction_idx
+    global inference_thread
 
     parser = argparse.ArgumentParser(
         description="3 CCTV people & vehicle counting"
@@ -2403,10 +2546,18 @@ def main():
 
         cameras[camera_id].load_config()
 
+    # Jalankan reader untuk setiap CCTV
     for cam in cameras.values():
-
         cam.reader_thread.start()
-        cam.worker_thread.start()
+
+    # Jalankan satu shared inference thread
+    inference_thread = threading.Thread(
+        target=shared_inference_worker,
+        args=(model_path, backend),
+        daemon=True
+    )
+
+    inference_thread.start()
 
     start_viewer()    
 

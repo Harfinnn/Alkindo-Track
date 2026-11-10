@@ -66,14 +66,14 @@ CAMERA_ALIASES = {"LANTAI2": "LANTAI2.1"}
 INFO_PANEL_CAMERA = "LANTAI1"
 
 # --- Thread CPU (diatur sebelum model YOLO dibuat) ---
-CPU_THREADS = 8
+CPU_THREADS = 6
 
 torch.set_num_threads(CPU_THREADS)
-cv2.setNumThreads(CPU_THREADS)
+cv2.setNumThreads(2)
 
 # --- Model dan tracker ---
 BASE_DIR = Path(__file__).resolve().parent
-MODEL_PATH = os.getenv("YOLO_MODEL_PATH", str(BASE_DIR / "models" / "yolo11l.pt"))
+MODEL_PATH = os.getenv("YOLO_MODEL_PATH", str(BASE_DIR / "models" / "yolo26l.pt"))
 
 
 # ============================================================
@@ -83,17 +83,17 @@ MODEL_PATH = os.getenv("YOLO_MODEL_PATH", str(BASE_DIR / "models" / "yolo11l.pt"
 FACE_CAMERA_ID = "LANTAI1"
 
 FACE_DATABASE = (
-    BASE_DIR / "database" / "face_database.npz"
+    BASE_DIR / "database" / "face_database_arcface.npz"
 )
 
 FACE_SIMILARITY_THRESHOLD = 0.50
 FACE_MIN_CONFIRMATIONS = 3
-FACE_MIN_DETECTION_SCORE = 0.45
-FACE_MIN_SIZE = 20
+FACE_MIN_DETECTION_SCORE = 0.6
+FACE_MIN_SIZE = 40
 
 # Ukuran input detektor wajah. Makin kecil makin cepat; crop kepala
 # sudah kecil, jadi 320 cukup. Naikkan ke 640 kalau wajah sering terlewat.
-FACE_DET_SIZE = (640, 640)
+FACE_DET_SIZE = (320, 320)
 
 FACE_ENGINE = None
 FACE_MATCHER = None
@@ -106,19 +106,20 @@ FACE_LOG_FILE = (
 # OpenVINO: lebih cepat di CPU Intel. Set YOLO_USE_OPENVINO=0 untuk
 # kembali ke model .pt. Kalau IMGSZ diubah, hapus folder *_openvino_model
 # supaya diexport ulang dengan ukuran baru.
-USE_OPENVINO = os.getenv("YOLO_USE_OPENVINO", "1") == "1"
+USE_OPENVINO = os.getenv("YOLO_USE_OPENVINO", "0") == "1"
 
 # Device OpenVINO: "intel:gpu" (iGPU, tercepat di i3-1215U) atau "intel:cpu".
 # Kalau iGPU gagal, otomatis turun ke "intel:cpu".
-INFERENCE_DEVICE = os.getenv("YOLO_DEVICE", "intel:gpu")
+INFERENCE_DEVICE = os.getenv("YOLO_DEVICE", "0")
 TRACKER_CONFIG = str(BASE_DIR / "config" / "custom_bytetrack_stable.yaml")
+USE_CUDA_FP16 = not USE_OPENVINO and os.getenv("YOLO_FP16", "1") == "1"
 
-IMGSZ = 960
+IMGSZ = 1024
 
 # Batas atas laju deteksi per kamera. Laju sebenarnya otomatis mengikuti
 # kecepatan YOLO: frame baru hanya diambil kalau YOLO sedang menganggur,
 # jadi tidak ada konversi warna / resize yang terbuang.
-INFERENCE_MAX_FPS = 15
+INFERENCE_MAX_FPS = 30
 PERSON_CLASS_ID = 0
 CONFIDENCE = 0.15
 
@@ -1709,7 +1710,7 @@ def load_model(device_hint=None, use_openvino=USE_OPENVINO):
 
     print(f"[MODEL] Backend PyTorch: {MODEL_PATH}")
 
-    return YOLO(MODEL_PATH), None
+    return YOLO(MODEL_PATH), INFERENCE_DEVICE
 
 
 def open_capture(url):
@@ -1879,6 +1880,7 @@ def inference_worker(cam, model, inference_device):
                 imgsz=IMGSZ,
                 tracker=TRACKER_CONFIG,
                 device=inference_device,
+                half=USE_CUDA_FP16,
                 verbose=False,
             )
 
@@ -2099,7 +2101,7 @@ def main():
         return
 
     print("=" * 60)
-    print("LOBBY PEOPLE TRACKING - STABLE (DUAL CCTV)")
+    print("LOBBY PEOPLE TRACKING - YOLO26 CUDA OPTIMIZED")
     print(f"{len(CAMERAS)} CCTV | {len(DOORS)} PINTU | YOLO + ByteTrack")
     print(f"YOLO IMGSZ: {IMGSZ} | FPS maks per kamera: {INFERENCE_MAX_FPS}")
     print(f"Tracker: {TRACKER_CONFIG}")
@@ -2113,19 +2115,43 @@ def main():
         )
         return
 
+    # Validasi jalur NVIDIA CUDA sebelum memuat YOLO.
+    if not USE_OPENVINO:
+        if not torch.cuda.is_available():
+            print(
+                "[ERROR] CUDA tidak tersedia pada interpreter ini. "
+                "Periksa PyTorch CUDA dan driver NVIDIA."
+            )
+            return
+
+        try:
+            gpu_index = int(INFERENCE_DEVICE)
+        except (TypeError, ValueError):
+            print(f"[ERROR] YOLO_DEVICE harus berupa indeks GPU, diterima: {INFERENCE_DEVICE!r}")
+            return
+
+        if gpu_index < 0 or gpu_index >= torch.cuda.device_count():
+            print(f"[ERROR] Indeks GPU {gpu_index} tidak tersedia.")
+            return
+
+        print(f"[GPU] {torch.cuda.get_device_name(gpu_index)}")
+        print(f"[GPU] PyTorch CUDA: {torch.version.cuda}")
+        print(f"[GPU] FP16: {USE_CUDA_FP16}")
+        print(f"[YOLO] Model: {MODEL_PATH} | imgsz={IMGSZ} | target={INFERENCE_MAX_FPS} FPS")
+
     # Satu instance model per kamera supaya tracker tidak tercampur.
     models = {}
     inference_device = None
 
     try:
         for index, camera_id in enumerate(CAMERAS):
-            if index == 0:
-                model, inference_device = load_model()
-            else:
-                model, _ = load_model(
-                    device_hint=inference_device,
-                    use_openvino=inference_device is not None,
-                )
+            model, loaded_device = load_model(
+                device_hint=inference_device,
+                use_openvino=USE_OPENVINO,
+            )
+
+            if loaded_device is not None:
+                inference_device = loaded_device
 
             models[camera_id] = model
 
@@ -2141,7 +2167,7 @@ def main():
         print("[FACE] Memuat Face Recognition...")
 
         FACE_ENGINE = FaceEngine(
-            det_size=(640, 640),
+            det_size=(320, 320),
             det_thresh=0.35,
         )
 
@@ -2166,11 +2192,9 @@ def main():
             on_recognized=on_face_recognized,
             stop_event=STOP_EVENT,
 
-            # Filter deteksi wajah
-            min_size=12,
-            min_score=0.35,
+            min_size=FACE_MIN_SIZE,
+            min_score=FACE_MIN_DETECTION_SCORE,
 
-            # Nonaktifkan filter sementara untuk pengujian
             max_yaw=0.0,
             min_sharpness=0.0,
 

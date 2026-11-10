@@ -1,166 +1,386 @@
+
+import os
 import threading
-from pathlib import Path
+from collections import defaultdict
 
 import numpy as np
 
 
 class FaceMatcher:
     """
-    Pencocokan embedding ke database + konfirmasi identitas per track ID.
+    Face Matcher menggunakan embedding DeepFace ArcFace.
 
-    Format database .npz:
-      - lama : name (1 nama) + embeddings (N, D)
-      - baru : labels (N,) nama per embedding + embeddings (N, D)  -> banyak orang
-    Thread-safe: dipanggil dari thread face dan thread inferensi.
-
-    Perubahan v2:
-      - margin: skor terbaik harus lebih tinggi dari orang LAIN terdekat
-        minimal sekian (default 0.05). Wajah yang mirip dua orang di
-        database ditolak (dianggap belum pasti), bukan ditebak.
-        margin=0 untuk perilaku lama.
+    Fitur:
+    - Load database embedding dari NPZ.
+    - Cosine similarity.
+    - Mendukung banyak foto untuk satu identitas.
+    - Konfirmasi identitas bertahap.
+    - Menyimpan identitas per track ID.
+    - Thread-safe untuk akses dari FaceWorker.
     """
+
+    EMBEDDING_SIZE = 512
 
     def __init__(
         self,
         database_path,
-        threshold=0.45,
+        threshold=0.50,
         min_confirmations=3,
-        max_misses=3,
-        margin=0.05,
     ):
-        self.database_path = Path(database_path)
-        self.threshold = threshold
-        self.min_confirmations = min_confirmations
-        self.max_misses = max_misses
-        self.margin = margin
+        self.database_path = str(database_path)
+        self.threshold = float(threshold)
+        self.min_confirmations = max(1, int(min_confirmations))
 
-        self.labels = None
-        self.embeddings = None
-        self._label_names = None
-        self._label_ids = None
+        self.lock = threading.RLock()
 
-        self.candidates = {}
-        self.confirmed = {}
-        self.lock = threading.Lock()
+        # Database identitas.
+        self.embeddings = np.empty(
+            (0, self.EMBEDDING_SIZE),
+            dtype=np.float32,
+        )
 
-        self.load_database()
+        self.names = np.empty((0,), dtype=str)
 
-    def load_database(self):
-        if not self.database_path.exists():
-            raise FileNotFoundError(
-                f"Face database tidak ditemukan: {self.database_path}"
+        # Status pengenalan setiap track.
+        self.track_candidates = {}
+        self.track_confirmations = defaultdict(int)
+        self.track_identities = {}
+
+        self._load_database()
+
+    # ---------------------------------------------------------
+    # LOAD DATABASE
+    # ---------------------------------------------------------
+
+    def _load_database(self):
+        if not os.path.exists(self.database_path):
+            print(
+                f"[FACE WARNING] Database tidak ditemukan: "
+                f"{self.database_path}"
+            )
+            print(
+                "[FACE WARNING] Face Recognition belum bisa "
+                "mengenali identitas sampai database dibuat."
+            )
+            return
+
+        try:
+            with np.load(
+                self.database_path,
+                allow_pickle=False,
+            ) as data:
+
+                if "embeddings" not in data or "names" not in data:
+                    raise ValueError(
+                        "Database harus memiliki keys "
+                        "'embeddings' dan 'names'."
+                    )
+
+                embeddings = np.asarray(
+                    data["embeddings"],
+                    dtype=np.float32,
+                )
+
+                names = np.asarray(
+                    data["names"],
+                    dtype=str,
+                )
+
+            if embeddings.ndim != 2:
+                raise ValueError(
+                    f"Dimensi embeddings tidak valid: "
+                    f"{embeddings.shape}"
+                )
+
+            if embeddings.shape[1] != self.EMBEDDING_SIZE:
+                raise ValueError(
+                    f"Embedding harus berukuran "
+                    f"{self.EMBEDDING_SIZE}, "
+                    f"didapatkan {embeddings.shape[1]}."
+                )
+
+            if len(embeddings) != len(names):
+                raise ValueError(
+                    "Jumlah embeddings tidak sama dengan jumlah names."
+                )
+
+            if len(embeddings) == 0:
+                raise ValueError("Database wajah masih kosong.")
+
+            # Buang embedding yang mengandung NaN atau Inf.
+            valid = (
+                np.isfinite(embeddings).all(axis=1)
+                & (np.linalg.norm(embeddings, axis=1) > 1e-10)
+                & (names != "")
             )
 
-        with np.load(self.database_path, allow_pickle=False) as data:
-            embeddings = np.asarray(data["embeddings"], dtype=np.float32)
+            embeddings = embeddings[valid]
+            names = names[valid]
 
-            if "labels" in data.files:
-                labels = np.asarray(data["labels"]).astype(str)
-            else:
-                labels = np.array([str(data["name"].item())] * len(embeddings))
+            if len(embeddings) == 0:
+                raise ValueError(
+                    "Tidak ada embedding valid di database."
+                )
 
-        if embeddings.ndim != 2 or len(embeddings) == 0:
-            raise ValueError("Format embedding database tidak valid")
+            # Normalisasi L2.
+            norms = np.linalg.norm(
+                embeddings,
+                axis=1,
+                keepdims=True,
+            )
 
-        if len(labels) != len(embeddings):
-            raise ValueError("Jumlah labels dan embeddings tidak sama")
+            embeddings = embeddings / np.maximum(norms, 1e-10)
 
-        norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
-        norms[norms == 0] = 1.0
+            self.embeddings = embeddings.astype(np.float32)
+            self.names = names
 
-        embeddings = embeddings / norms
-        names, ids = np.unique(labels, return_inverse=True)
+            print("[FACE] ArcFace database loaded.")
+            print(f"[FACE] Jumlah embedding : {len(self.embeddings)}")
+            print(
+                f"[FACE] Jumlah identitas : "
+                f"{len(set(self.names.tolist()))}"
+            )
+            print(f"[FACE] Similarity threshold: {self.threshold}")
+            print(
+                f"[FACE] Minimum confirmations: "
+                f"{self.min_confirmations}"
+            )
 
-        with self.lock:
-            self.embeddings = embeddings
-            self.labels = labels
-            self._label_names = names
-            self._label_ids = ids.reshape(-1)
+        except Exception as error:
+            raise RuntimeError(
+                f"Gagal membaca database wajah: {error}"
+            ) from error
 
-        print(
-            f"[FACE] Database loaded: {len(names)} orang "
-            f"({len(embeddings)} samples) | threshold={self.threshold} "
-            f"| margin={self.margin}"
-        )
+    # ---------------------------------------------------------
+    # COSINE SIMILARITY
+    # ---------------------------------------------------------
 
-    def match(self, embedding):
+    @staticmethod
+    def cosine_similarity(query, database):
         """
-        embedding sudah ter-normalisasi (FaceEngine.get_embedding).
-        Mengembalikan (nama, skor), atau (None, skor terbaik) kalau di bawah
-        threshold atau terlalu mirip dengan orang lain di database.
+        Menghitung cosine similarity antara satu embedding
+        dan seluruh embedding database.
+
+        Embedding diasumsikan sudah dinormalisasi.
         """
 
-        if embedding is None:
+        query = np.asarray(query, dtype=np.float32).reshape(-1)
+
+        if query.shape[0] != 512:
+            raise ValueError(
+                f"Embedding query harus 512 dimensi: {query.shape}"
+            )
+
+        query_norm = np.linalg.norm(query)
+
+        if query_norm <= 1e-10:
+            return None
+
+        query = query / query_norm
+
+        return np.dot(database, query)
+
+    # ---------------------------------------------------------
+    # MATCHING
+    # ---------------------------------------------------------
+
+    def find_match(self, embedding):
+        """
+        Mencari identitas dengan similarity tertinggi.
+
+        Return:
+            (name, similarity)
+
+        Jika tidak memenuhi threshold:
+            (None, similarity_tertinggi)
+        """
+
+        if len(self.embeddings) == 0:
             return None, 0.0
 
-        similarities = self.embeddings @ embedding
+        try:
+            similarities = self.cosine_similarity(
+                embedding,
+                self.embeddings,
+            )
 
-        # Skor terbaik PER ORANG (bukan per sampel), supaya orang dengan
-        # banyak sampel tidak otomatis menang atas orang dengan sedikit sampel.
-        best_per_label = np.full(
-            len(self._label_names), -1.0, dtype=np.float32
-        )
-        np.maximum.at(best_per_label, self._label_ids, similarities)
+            if similarities is None:
+                return None, 0.0
 
-        order = np.argsort(best_per_label)[::-1]
-        best = int(order[0])
-        score = float(best_per_label[best])
+            # Ambil similarity terbaik untuk setiap identitas.
+            best_by_name = {}
 
-        if score < self.threshold:
-            return None, score
+            for index, similarity in enumerate(similarities):
+                name = str(self.names[index])
+                similarity = float(similarity)
 
-        if self.margin > 0 and len(order) > 1:
-            runner_up = float(best_per_label[order[1]])
+                if (
+                    name not in best_by_name
+                    or similarity > best_by_name[name]
+                ):
+                    best_by_name[name] = similarity
 
-            if score - runner_up < self.margin:
-                return None, score
+            if not best_by_name:
+                return None, 0.0
 
-        return str(self._label_names[best]), score
+            # Urutkan kandidat berdasarkan similarity tertinggi.
+            ranked_candidates = sorted(
+                best_by_name.items(),
+                key=lambda item: item[1],
+                reverse=True,
+            )
+
+            best_name, best_score = ranked_candidates[0]
+
+            # Kandidat terbaik harus melewati threshold.
+            if best_score < self.threshold:
+                return None, best_score
+
+            # Pastikan kandidat terbaik cukup berbeda dari kandidat kedua.
+            if len(ranked_candidates) >= 2:
+                second_name, second_score = ranked_candidates[1]
+
+                margin = best_score - second_score
+
+                if margin < 0.05:
+                    print(
+                        f"[FACE AMBIGUOUS] "
+                        f"TOP1={best_name}:{best_score:.3f} | "
+                        f"TOP2={second_name}:{second_score:.3f} | "
+                        f"MARGIN={margin:.3f}"
+                    )
+                    return None, best_score
+
+            return best_name, best_score
+
+        except Exception as error:
+            print(f"[FACE MATCH ERROR] {error}")
+            return None, 0.0
+
+    # ---------------------------------------------------------
+    # UPDATE TRACK
+    # ---------------------------------------------------------
 
     def update_track(self, track_id, embedding):
+        """
+        Memperbarui hasil pengenalan untuk track tertentu.
+
+        Identitas baru hanya diberikan setelah mencapai
+        min_confirmations secara berturut-turut.
+
+        Return:
+            str  : nama identitas yang sudah dikonfirmasi.
+            None : belum dikenali.
+        """
+
         with self.lock:
-            if track_id in self.confirmed:
-                return self.confirmed[track_id]
 
-            name, score = self.match(embedding)
-            state = self.candidates.get(track_id)
+            # Jika sudah dikenali, jangan ubah identitas.
+            if track_id in self.track_identities:
+                return self.track_identities[track_id]
 
+            name, similarity = self.find_match(embedding)
+
+            # Tidak ada identitas yang cocok.
             if name is None:
-                # Toleransi: satu frame meleset tidak langsung mengulang dari nol.
-                if state is not None:
-                    state["miss"] += 1
-
-                    if state["miss"] >= self.max_misses:
-                        del self.candidates[track_id]
+                self.track_candidates.pop(track_id, None)
+                self.track_confirmations[track_id] = 0
 
                 return None
 
-            if state is None or state["name"] != name:
-                state = {"name": name, "count": 0, "miss": 0, "total": 0.0}
-                self.candidates[track_id] = state
+            previous_name = self.track_candidates.get(track_id)
 
-            state["count"] += 1
-            state["miss"] = 0
-            state["total"] += score
+            # Kandidat berubah, mulai hitung ulang.
+            if previous_name != name:
+                self.track_candidates[track_id] = name
+                self.track_confirmations[track_id] = 1
+            else:
+                self.track_confirmations[track_id] += 1
 
-            if state["count"] >= self.min_confirmations:
-                self.confirmed[track_id] = name
-                del self.candidates[track_id]
+            count = self.track_confirmations[track_id]
 
-                print(
-                    f"[FACE MATCH] Track ID {track_id} => {name} | "
-                    f"avg similarity={state['total'] / state['count']:.3f}"
-                )
+            print(
+                f"[FACE MATCH] ID={track_id} | "
+                f"NAME={name} | "
+                f"SIM={similarity:.3f} | "
+                f"CONFIRM={count}/{self.min_confirmations}"
+            )
 
-                return name
+            # Belum memenuhi jumlah konfirmasi.
+            if count < self.min_confirmations:
+                return None
 
-            return None
+            # Identitas resmi untuk track ini.
+            self.track_identities[track_id] = name
+
+            print(
+                f"[FACE RECOGNIZED] ID={track_id} | "
+                f"NAME={name}"
+            )
+
+            return name
+
+    # ---------------------------------------------------------
+    # GET IDENTITY
+    # ---------------------------------------------------------
 
     def get_identity(self, track_id):
+        """
+        Mengambil identitas yang sudah dikonfirmasi.
+        """
+
         with self.lock:
-            return self.confirmed.get(track_id)
+            return self.track_identities.get(track_id)
+
+    # ---------------------------------------------------------
+    # REMOVE TRACK
+    # ---------------------------------------------------------
 
     def remove_track(self, track_id):
+        """
+        Menghapus seluruh status pengenalan dari track.
+        Dipanggil ketika track orang sudah tidak aktif.
+        """
+
         with self.lock:
-            self.candidates.pop(track_id, None)
-            self.confirmed.pop(track_id, None)
+            self.track_candidates.pop(track_id, None)
+            self.track_confirmations.pop(track_id, None)
+            self.track_identities.pop(track_id, None)
+
+    # ---------------------------------------------------------
+    # DATABASE INFORMATION
+    # ---------------------------------------------------------
+
+    def get_database_info(self):
+        """
+        Informasi ringkas database wajah.
+        """
+
+        with self.lock:
+            identities = sorted(
+                set(self.names.tolist())
+            )
+
+            return {
+                "total_embeddings": len(self.embeddings),
+                "total_identities": len(identities),
+                "identities": identities,
+                "threshold": self.threshold,
+                "min_confirmations": self.min_confirmations,
+            }
+
+    # ---------------------------------------------------------
+    # CLEANUP
+    # ---------------------------------------------------------
+
+    def clear_tracks(self):
+        """
+        Menghapus seluruh status track tanpa menghapus database.
+        """
+
+        with self.lock:
+            self.track_candidates.clear()
+            self.track_confirmations.clear()
+            self.track_identities.clear()
+
+            print("[FACE] Seluruh track recognition dibersihkan.")
