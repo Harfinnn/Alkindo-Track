@@ -1,0 +1,80 @@
+/* =========================================
+   TOP HEADER
+========================================= */
+
+header {
+  position: sticky;
+  z-index: 100;
+  top: 0;
+  display: flex;
+  width: calc(100% - var(--sidebar-width));
+  min-height: var(--header-height);
+  align-items: center;
+  gap: 16px;
+  margin-left: var(--sidebar-width);
+  padding: 14px 24px;
+  border-bottom: 1px solid var(--line);
+  background: var(--panel);
+}
+
+.header-title {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 3px;
+  margin-right: auto;
+}
+
+.header-title h1 {
+  margin: 0;
+}
+
+.header-title small {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.header-right {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 20px;
+}
+
+.conn {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 0.9rem;
+  white-space: nowrap;
+}
+
+.dot {
+  width: 10px;
+  height: 10px;
+  flex: 0 0 10px;
+  border-radius: 50%;
+  background: var(--idle);
+}
+
+.dot.ok {
+  background: var(--ok);
+}
+
+.dot.bad {
+  background: var(--bad);
+}
+
+#clock {
+  color: var(--muted);
+  font-size: 0.9rem;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .dot {
+    transition: background-color 0.3s ease;
+  }
+}

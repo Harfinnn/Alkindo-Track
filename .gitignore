@@ -8,3 +8,4 @@ models/*_openvino_model/
 models/.cache/
 logs/
 data/
+.env

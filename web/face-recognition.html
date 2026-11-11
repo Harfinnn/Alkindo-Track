@@ -1,0 +1,389 @@
+
+<!DOCTYPE html>
+<html lang="id">
+
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+
+    <title>Face Recognition | GateWatch</title>
+
+    <!-- GLOBAL CSS -->
+    <link rel="stylesheet" href="assets/css/variables.css">
+    <link rel="stylesheet" href="assets/css/global.css">
+    <link rel="stylesheet" href="assets/css/sidebar.css">
+
+    <!-- PAGE CSS -->
+    <link rel="stylesheet" href="assets/css/face-recognition.css">
+
+    <!-- RESPONSIVE CSS -->
+    <link rel="stylesheet" href="assets/css/responsive.css">
+</head>
+
+<body>
+
+    <!-- SIDEBAR -->
+    <div id="sidebar-container"></div>
+
+    <!-- MAIN CONTENT -->
+    <main id="face-recognition-page">
+
+        <!-- ================================= -->
+        <!-- PAGE HEADING                      -->
+        <!-- ================================= -->
+
+        <div class="page-heading">
+
+            <div>
+                <h1>Face Recognition</h1>
+
+                <p>
+                    Pemantauan dan identifikasi wajah secara real-time.
+                </p>
+            </div>
+
+            <div class="monitoring-indicator">
+                <span class="status-dot"></span>
+                FACE AI ACTIVE
+            </div>
+
+        </div>
+
+
+        <!-- ================================= -->
+        <!-- RECOGNITION STATISTICS            -->
+        <!-- ================================= -->
+
+        <section class="recognition-stats">
+
+            <!-- TOTAL DETECTED -->
+            <div class="dashboard-card recognition-stat-card">
+
+                <div class="stat-icon purple">
+                    <span>◉</span>
+                </div>
+
+                <div>
+                    <p>Total Detected</p>
+
+                    <h2 id="total-detected">0</h2>
+
+                    <small>
+                        Wajah terdeteksi saat ini
+                    </small>
+                </div>
+
+            </div>
+
+
+            <!-- TOTAL RECOGNIZED -->
+            <div class="dashboard-card recognition-stat-card">
+
+                <div class="stat-icon teal">
+                    <span>✓</span>
+                </div>
+
+                <div>
+                    <p>Total Recognized</p>
+
+                    <h2 id="total-recognized">0</h2>
+
+                    <small>
+                        Wajah berhasil dikenali
+                    </small>
+                </div>
+
+            </div>
+
+
+            <!-- TOTAL UNKNOWN -->
+            <div class="dashboard-card recognition-stat-card">
+
+                <div class="stat-icon orange">
+                    <span>?</span>
+                </div>
+
+                <div>
+                    <p>Total Unknown</p>
+
+                    <h2 id="total-unknown">0</h2>
+
+                    <small>
+                        Wajah belum teridentifikasi
+                    </small>
+                </div>
+
+            </div>
+
+        </section>
+
+
+        <!-- ================================= -->
+        <!-- MAIN RECOGNITION LAYOUT           -->
+        <!-- ================================= -->
+
+        <section class="recognition-layout">
+
+
+            <!-- ================================= -->
+            <!-- MAIN COLUMN                      -->
+            <!-- ================================= -->
+
+            <div class="recognition-main-column">
+
+
+                <!-- LIVE FACE RECOGNITION -->
+                <section class="dashboard-card face-camera-card">
+
+                    <div class="card-heading">
+
+                        <div class="card-icon purple">
+                            <span>◉</span>
+                        </div>
+
+                        <div>
+                            <h2>Live Face Recognition</h2>
+
+                            <p>
+                                CCTV Face Detection & Recognition
+                            </p>
+                        </div>
+
+                    </div>
+
+
+                    <!-- CAMERA VIEWER -->
+                    <div class="well" id="well">
+
+                        <img
+                            id="stream"
+                            src=""
+                            alt="Live Face Recognition Stream"
+                        >
+
+                        <div class="msg" id="msg">
+
+                            <span class="loading-indicator"></span>
+
+                            <p>
+                                Menunggu koneksi kamera...
+                            </p>
+
+                        </div>
+
+                    </div>
+
+                </section>
+
+
+                <!-- RECOGNITION ACTIVITY -->
+                <section class="dashboard-card recognition-activity-card">
+
+                    <div class="card-heading">
+
+                        <div class="card-icon teal">
+                            <span>≡</span>
+                        </div>
+
+                        <div>
+                            <h2>Recognition Activity</h2>
+
+                            <p>
+                                Aktivitas pengenalan wajah terbaru
+                            </p>
+                        </div>
+
+                        <span
+                            class="activity-count"
+                            id="activity-count"
+                        >
+                            0 Events
+                        </span>
+
+                    </div>
+
+
+                    <!-- ACTIVITY LIST -->
+                    <div
+                        class="recognition-activity-list"
+                        id="recognition-activity"
+                    >
+
+                        <div class="activity-empty">
+
+                            <p>
+                                Belum ada aktivitas pengenalan wajah.
+                            </p>
+
+                        </div>
+
+                    </div>
+
+                </section>
+
+            </div>
+
+
+            <!-- ================================= -->
+            <!-- SIDE COLUMN                      -->
+            <!-- ================================= -->
+
+            <aside class="recognition-side-column">
+
+
+                <!-- LATEST RECOGNITION -->
+                <section class="dashboard-card latest-recognition-card">
+
+                    <div class="card-heading">
+
+                        <div class="card-icon purple">
+                            <span>◉</span>
+                        </div>
+
+                        <div>
+                            <h2>Latest Recognition</h2>
+
+                            <p>
+                                Wajah terakhir yang dikenali
+                            </p>
+                        </div>
+
+                    </div>
+
+
+                    <!-- LATEST FACE -->
+                    <div class="latest-recognition-content">
+
+                        <div
+                            class="latest-face-avatar"
+                            id="latest-face-avatar"
+                        >
+
+                            <span>?</span>
+
+                        </div>
+
+
+                        <div class="latest-face-information">
+
+                            <h3 id="latest-face-name">
+                                Belum Ada Data
+                            </h3>
+
+                            <p id="latest-face-detail">
+                                Menunggu pengenalan wajah...
+                            </p>
+
+                            <span
+                                id="latest-face-confidence"
+                                class="recognition-confidence"
+                            >
+                                0% Confidence
+                            </span>
+
+                        </div>
+
+                    </div>
+
+                </section>
+
+
+                <!-- ENGINE INFORMATION -->
+                <section class="dashboard-card recognition-info-card">
+
+                    <div class="card-heading">
+
+                        <div class="card-icon navy">
+                            <span>⚙</span>
+                        </div>
+
+                        <div>
+                            <h2>Engine Information</h2>
+
+                            <p>
+                                Informasi konfigurasi AI
+                            </p>
+                        </div>
+
+                    </div>
+
+
+                    <!-- ENGINE DETAILS -->
+                    <div class="recognition-info-list">
+
+
+                        <!-- DETECTION MODEL -->
+                        <div class="info-item">
+
+                            <span>
+                                Face Detection Model
+                            </span>
+
+                            <strong id="face-detection-model">
+                                InsightFace Detection
+                            </strong>
+
+                        </div>
+
+
+                        <!-- RECOGNITION MODEL -->
+                        <div class="info-item">
+
+                            <span>
+                                Face Recognition Model
+                            </span>
+
+                            <strong id="face-recognition-model">
+                                ArcFace
+                            </strong>
+
+                        </div>
+
+
+                        <!-- INFERENCE BACKEND -->
+                        <div class="info-item">
+
+                            <span>
+                                Inference Backend
+                            </span>
+
+                            <strong id="face-backend">
+                                ONNX Runtime
+                            </strong>
+
+                        </div>
+
+
+                        <!-- PROCESSING DEVICE -->
+                        <div class="info-item">
+
+                            <span>
+                                Processing Device
+                            </span>
+
+                            <strong id="face-device">
+                                NVIDIA CUDA
+                            </strong>
+
+                        </div>
+
+                    </div>
+
+                </section>
+
+            </aside>
+
+        </section>
+
+    </main>
+
+
+    <!-- JAVASCRIPT -->
+    <script
+        type="module"
+        src="assets/js/face-recognition-page.js"
+    ></script>
+    <script type="module" src="assets/js/auth.js"></script>
+
+</body>
+</html>

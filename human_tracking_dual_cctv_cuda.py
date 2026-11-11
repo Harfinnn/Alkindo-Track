@@ -14,20 +14,23 @@ if RTSP_USE_TCP:
 import argparse
 import csv
 import json
+import mimetypes
 import shutil
 import time
 import threading
+
 from collections import deque, Counter
 from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import quote
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import quote, urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, unquote, quote
 
 import cv2
 import numpy as np
 import torch
+import signal
+
 from ultralytics import YOLO
 
 from ultralytics import YOLO
@@ -71,7 +74,6 @@ def build_rtsp(camera):
         f"@{camera['ip']}:{camera['port']}"
         f"/Streaming/Channels/{camera['channel']}"
     )
-
 
 GATE_CAMERAS = CAMERA_CONFIG["GERBANG"]
 
@@ -417,6 +419,10 @@ def has_motion(prev_gray, gray):
     )
 
     return cv2.countNonZero(mask) >= MOTION_MIN_PIXELS
+
+def handle_stop_signal(signum, frame):
+    print("\nPerintah STOP diterima...")
+    stop_event.set()
 
 
 # =========================================================
@@ -2011,11 +2017,15 @@ class ViewerHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
 
-        path = self.path.split("?")[0]
+        # Pisahkan path dari query string dan decode URL (%20, dll).
+        path = unquote(urlparse(self.path).path)
 
+        # ---------------------------------------------
+        # API: pertahankan endpoint backend yang lama.
+        # ---------------------------------------------
         if path == "/api/status":
             self._send(
-                200, "application/json",
+                200, "application/json; charset=utf-8",
                 json.dumps(build_status()).encode("utf-8")
             )
             return
@@ -2024,33 +2034,66 @@ class ViewerHandler(BaseHTTPRequestHandler):
             qs = parse_qs(urlparse(self.path).query)
             try:
                 limit = int(qs.get("limit", ["50"])[0])
-            except ValueError:
+            except (ValueError, TypeError):
                 limit = 50
+
             self._send(
-                200, "application/json",
+                200, "application/json; charset=utf-8",
                 json.dumps(read_recent_logs(limit)).encode("utf-8")
             )
             return
 
+        # ---------------------------------------------
+        # CCTV MJPEG stream: tetap menggunakan pipeline.
+        # ---------------------------------------------
         if path == "/stream":
             self._stream()
             return
 
-        if path in ("/", "/index.html"):
+        # ---------------------------------------------
+        # Frontend: index.html, CSS, JS, dan components.
+        # Semua file diambil dari folder BASE_DIR/web.
+        # ---------------------------------------------
+        relative_path = "index.html" if path in ("", "/") else path.lstrip("/")
 
-            try:
-                body = (WEB_DIR / "index.html").read_bytes()
-            except OSError:
-                self._send(
-                    404, "text/plain; charset=utf-8",
-                    b"web/index.html tidak ditemukan"
-                )
-                return
+        try:
+            web_root = WEB_DIR.resolve()
+            file_path = (web_root / relative_path).resolve()
 
-            self._send(200, "text/html; charset=utf-8", body)
+            # Cegah path traversal keluar dari folder web.
+            file_path.relative_to(web_root)
+
+            if not file_path.is_file():
+                raise FileNotFoundError(relative_path)
+
+            body = file_path.read_bytes()
+
+        except (OSError, ValueError):
+            self._send(
+                404, "text/plain; charset=utf-8",
+                f"File tidak ditemukan: {path}".encode("utf-8")
+            )
             return
 
-        self._send(404, "text/plain", b"Not found")
+        content_type, _ = mimetypes.guess_type(str(file_path))
+
+        if not content_type:
+            content_type = "application/octet-stream"
+
+        # MIME eksplisit agar ES Modules dan stylesheet terbaca konsisten.
+        suffix = file_path.suffix.lower()
+        if suffix == ".js":
+            content_type = "text/javascript; charset=utf-8"
+        elif suffix == ".css":
+            content_type = "text/css; charset=utf-8"
+        elif suffix in (".html", ".htm"):
+            content_type = "text/html; charset=utf-8"
+        elif suffix == ".json":
+            content_type = "application/json; charset=utf-8"
+        elif suffix == ".svg":
+            content_type = "image/svg+xml"
+
+        self._send(200, content_type, body)
 
     def _stream(self):
 
@@ -2784,5 +2827,8 @@ def main():
 # =========================================================
 
 if __name__ == "__main__":
+    
+    if hasattr(signal, "SIGBREAK"):
+        signal.signal(signal.SIGBREAK, handle_stop_signal)
 
     main()

@@ -1,0 +1,324 @@
+
+<!DOCTYPE html>
+<html lang="id">
+
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+
+    <title>Live Monitoring | GateWatch</title>
+
+    <!-- GLOBAL CSS -->
+    <link rel="stylesheet" href="assets/css/variables.css">
+    <link rel="stylesheet" href="assets/css/global.css">
+    <link rel="stylesheet" href="assets/css/sidebar.css">
+
+    <!-- PAGE CSS -->
+    <link rel="stylesheet" href="assets/css/monitoring.css">
+
+    <!-- RESPONSIVE CSS -->
+    <link rel="stylesheet" href="assets/css/responsive.css">
+</head>
+
+<body>
+
+    <!-- SIDEBAR -->
+    <div id="sidebar-container"></div>
+
+
+    <!-- MAIN CONTENT -->
+    <main id="monitoring-page">
+
+
+        <!-- ================================= -->
+        <!-- PAGE HEADING                      -->
+        <!-- ================================= -->
+
+        <div class="page-heading">
+
+            <div>
+                <h1>Live Monitoring</h1>
+
+                <p>
+                    Pemantauan CCTV, okupansi, dan pergerakan objek.
+                </p>
+            </div>
+
+            <div class="monitoring-indicator">
+                <span class="status-dot"></span>
+                LIVE STREAM
+            </div>
+
+        </div>
+
+
+        <!-- ================================= -->
+        <!-- MAIN MONITORING LAYOUT            -->
+        <!-- ================================= -->
+
+        <section class="monitoring-layout">
+
+
+            <!-- ================================= -->
+            <!-- MAIN COLUMN                      -->
+            <!-- ================================= -->
+
+            <div class="monitoring-main-column">
+
+
+                <!-- LIVE CCTV -->
+                <section class="dashboard-card camera-live-card">
+
+                    <div class="card-heading">
+
+                        <div class="card-icon navy">
+                            <span>▣</span>
+                        </div>
+
+                        <div>
+                            <h2>Live CCTV Monitoring</h2>
+
+                            <p>
+                                Pemantauan kamera secara langsung.
+                            </p>
+                        </div>
+
+                    </div>
+
+
+                    <!-- CAMERA VIEWER -->
+                    <div class="well" id="well">
+
+                        <img
+                            id="stream"
+                            alt="Live CCTV Monitoring"
+                        >
+
+                        <div class="msg" id="msg">
+                            Video belum tersambung. Mencoba lagi otomatis.
+                        </div>
+
+                    </div>
+
+
+                    <!-- STREAM STATUS -->
+                    <div class="camera-live-footer">
+
+                        <span id="streamStatus">
+                            Menghubungkan ke kamera...
+                        </span>
+
+                        <span>
+                            Auto reconnect aktif
+                        </span>
+
+                    </div>
+
+                </section>
+
+
+                <!-- ================================= -->
+                <!-- OCCUPANCY & DAILY COUNTER        -->
+                <!-- ================================= -->
+
+                <div class="monitoring-data-grid">
+
+
+                    <!-- OCCUPANCY -->
+                    <section class="dashboard-card occupancy-card">
+
+                        <div class="card-heading">
+
+                            <div class="card-icon teal">
+                                <span>♙</span>
+                            </div>
+
+                            <div>
+                                <h2>Okupansi</h2>
+
+                                <p>
+                                    Jumlah objek di dalam dan di luar area PT.
+                                </p>
+                            </div>
+
+                        </div>
+
+
+                        <div class="table-container">
+
+                            <table>
+
+                                <thead>
+                                    <tr>
+                                        <th>Kelas</th>
+                                        <th>Di dalam PT</th>
+                                        <th>Di luar</th>
+                                    </tr>
+                                </thead>
+
+                                <tbody id="occ"></tbody>
+
+                            </table>
+
+                        </div>
+
+                    </section>
+
+
+                    <!-- DAILY COUNTER -->
+                    <section class="dashboard-card daily-counter-card">
+
+                        <div class="card-heading">
+
+                            <div class="card-icon orange">
+                                <span>↔</span>
+                            </div>
+
+                            <div>
+                                <h2>Hitungan Hari Ini</h2>
+
+                                <p>
+                                    Akumulasi pergerakan objek masuk dan keluar.
+                                </p>
+                            </div>
+
+                        </div>
+
+
+                        <div class="table-container">
+
+                            <table>
+
+                                <thead>
+                                    <tr>
+                                        <th>Kelas</th>
+                                        <th>Masuk</th>
+                                        <th>Keluar</th>
+                                    </tr>
+                                </thead>
+
+                                <tbody id="cnt"></tbody>
+
+                            </table>
+
+                        </div>
+
+                    </section>
+
+                </div>
+
+            </div>
+
+
+            <!-- ================================= -->
+            <!-- SIDE COLUMN                      -->
+            <!-- ================================= -->
+
+            <aside class="monitoring-side-column">
+
+
+                <!-- CAMERA STATUS -->
+                <section class="dashboard-card camera-card">
+
+                    <div class="card-heading">
+
+                        <div class="card-icon navy">
+                            <span>▣</span>
+                        </div>
+
+                        <div>
+                            <h2>Status Kamera</h2>
+
+                            <p>
+                                Kondisi perangkat CCTV.
+                            </p>
+                        </div>
+
+                    </div>
+
+
+                    <!-- CAMERA LIST -->
+                    <div id="cams"></div>
+
+                </section>
+
+            </aside>
+
+        </section>
+
+        <!-- ACTIVITY LOGS -->
+        <section class="log-card">
+          <div class="log-card-header">
+            <div>
+              <h2>Riwayat Tracking</h2>
+              <p>Daftar 50 kejadian terbaru dari sistem CCTV.</p>
+            </div>
+
+            <div class="log-header-info">
+              <span class="log-total" id="logCount">0 kejadian</span>
+              <button id="refreshLogs" class="refresh-button" type="button">
+                <span>↻</span>
+                Refresh
+              </button>
+            </div>
+          </div>
+
+          <div class="log-table-wrapper">
+            <table class="activity-table">
+              <colgroup>
+                <col class="col-time">
+                <col class="col-camera">
+                <col class="col-gate">
+                <col class="col-category">
+                <col class="col-direction">
+                <col class="col-track">
+              </colgroup>
+
+              <thead>
+                <tr>
+                  <th>WAKTU</th>
+                  <th>KAMERA</th>
+                  <th>GATE</th>
+                  <th>KELAS OBJEK</th>
+                  <th>ARAH</th>
+                  <th>TRACK ID</th>
+                </tr>
+              </thead>
+
+              <tbody id="logs"></tbody>
+            </table>
+
+            <div class="empty" id="logEmpty" hidden>
+              <div class="empty-icon">≡</div>
+              <strong>Belum ada aktivitas</strong>
+              <p>Data tracking akan muncul ketika sistem mendeteksi pergerakan objek.</p>
+            </div>
+          </div>
+
+          <div class="log-footer">
+            <span>Menampilkan maksimal 50 kejadian terbaru</span>
+            <span id="lastUpdated">Menunggu data...</span>
+          </div>
+        </section>
+
+        <!-- ================================= -->
+        <!-- INFORMATION                       -->
+        <!-- ================================= -->
+
+        <p class="hint">
+            Garis hitung dan ROI diatur dari aplikasi laptop.
+        </p>
+
+    </main>
+
+
+    <!-- JAVASCRIPT -->
+    <script
+        type="module"
+        src="assets/js/monitoring-page.js"
+    ></script>
+    <script type="module" src="assets/js/auth.js"></script>
+
+</body>
+
+</html>

@@ -1,0 +1,170 @@
+
+<!DOCTYPE html>
+<html lang="id">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+
+    <title>Login | GateWatch</title>
+
+    <link rel="stylesheet" href="assets/css/login.css">
+</head>
+
+<body>
+
+    <main class="login-page">
+
+        <!-- BRANDING PANEL -->
+        <section class="login-brand-panel">
+
+            <div class="brand-logo">
+                <div class="brand-mark">G</div>
+
+                <div>
+                    <strong>GATEWATCH</strong>
+                    <span>INTELLIGENT MONITORING</span>
+                </div>
+            </div>
+
+            <div class="brand-content">
+
+                <span class="brand-eyebrow">
+                    AI SECURITY MONITORING SYSTEM
+                </span>
+
+                <h1>
+                    Intelligent Security.
+                    <span>Real-Time Awareness.</span>
+                </h1>
+
+                <p>
+                    Centralized CCTV monitoring powered by
+                    Artificial Intelligence, People Tracking,
+                    Vehicle Detection, and Face Recognition.
+                </p>
+
+                <div class="brand-features">
+
+                    <div class="feature-item">
+                        <span class="feature-icon">◎</span>
+                        <span>Face Recognition</span>
+                    </div>
+
+                    <div class="feature-item">
+                        <span class="feature-icon">⌖</span>
+                        <span>People & Vehicle Tracking</span>
+                    </div>
+
+                    <div class="feature-item">
+                        <span class="feature-icon">◈</span>
+                        <span>Real-Time Monitoring</span>
+                    </div>
+
+                </div>
+
+            </div>
+
+            <div class="brand-footer">
+                <span class="live-dot"></span>
+                GATEWATCH SECURITY PLATFORM
+            </div>
+
+        </section>
+
+        <!-- LOGIN FORM -->
+        <section class="login-form-panel">
+
+            <div class="login-form-wrapper">
+
+                <div class="mobile-brand">
+                    <div class="brand-mark">G</div>
+                    <strong>GATEWATCH</strong>
+                </div>
+
+                <div class="login-heading">
+                    <span class="eyebrow">WELCOME BACK</span>
+
+                    <h2>Sign in to your account</h2>
+
+                    <p>
+                        Masukkan kredensial Administrator
+                        untuk mengakses GateWatch.
+                    </p>
+                </div>
+
+                <form id="login-form">
+
+                    <div class="form-group">
+                        <label for="username">Username</label>
+
+                        <input
+                            type="text"
+                            id="username"
+                            name="username"
+                            placeholder="Masukkan username"
+                            autocomplete="username"
+                            required
+                        >
+                    </div>
+
+                    <div class="form-group">
+                        <label for="password">Password</label>
+
+                        <div class="password-wrapper">
+                            <input
+                                type="password"
+                                id="password"
+                                name="password"
+                                placeholder="Masukkan password"
+                                autocomplete="current-password"
+                                required
+                            >
+
+                            <button
+                                type="button"
+                                id="toggle-password"
+                                aria-label="Tampilkan password"
+                            >
+                                Show
+                            </button>
+                        </div>
+                    </div>
+
+                    <div
+                        id="login-message"
+                        class="login-message"
+                        role="alert"
+                        aria-live="polite"
+                        hidden
+                    ></div>
+
+                    <button
+                        type="submit"
+                        id="login-button"
+                        class="login-button"
+                    >
+                        <span id="login-button-text">Sign In</span>
+                        <span class="login-arrow">→</span>
+                    </button>
+
+                </form>
+
+                <div class="login-security">
+                    <span>◈</span>
+                    Secure Administrator Access
+                </div>
+
+            </div>
+
+            <footer class="login-footer">
+                © 2026 GateWatch. All rights reserved.
+            </footer>
+
+        </section>
+
+    </main>
+
+    <script type="module" src="assets/js/login.js"></script>
+
+</body>
+</html>

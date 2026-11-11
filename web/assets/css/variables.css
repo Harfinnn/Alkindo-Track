@@ -1,0 +1,52 @@
+/* =========================================
+   GATEWATCH - DESIGN TOKENS
+========================================= */
+
+:root {
+  /* Layout */
+  --sidebar-width: 240px;
+  --header-height: 76px;
+  --content-max-width: 1680px;
+
+  /* Brand */
+  --brand-primary: #0f766e;
+  --brand-primary-hover: #115e59;
+  --brand-accent: #d97706;
+
+  /* Application */
+  --bg: #e9edf1;
+  --panel: #f8fafb;
+  --ink: #16202a;
+  --muted: #5b6875;
+  --line: #cfd7de;
+  --well: #101820;
+
+  /* Status */
+  --in: #17794a;
+  --out: #a24b0b;
+  --ok: #17794a;
+  --idle: #4a5d70;
+  --bad: #b3261e;
+
+  /* Sidebar */
+  --sidebar-bg: #111827;
+  --sidebar-hover: #1f2937;
+  --sidebar-active: var(--brand-primary);
+  --sidebar-text: #cbd5e1;
+  --sidebar-muted: #8492a6;
+  --sidebar-border: #293548;
+
+  /* Surface */
+  --table-border: #e3e8ec;
+  --shadow-sm: 0 2px 8px rgba(15, 23, 42, 0.06);
+  --shadow-md: 0 8px 24px rgba(15, 23, 42, 0.10);
+
+  /* Shape & spacing */
+  --radius-sm: 6px;
+  --radius-md: 9px;
+  --radius-lg: 12px;
+
+  /* Typography */
+  font-family: "Segoe UI", system-ui, -apple-system, BlinkMacSystemFont,
+    "Helvetica Neue", Arial, sans-serif;
+}

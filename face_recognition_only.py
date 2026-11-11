@@ -12,6 +12,7 @@ Kontrol: Q keluar | [ / ] turunkan / naikkan threshold | D ganti ukuran deteksi
 """
 
 import os
+import random
 
 if os.getenv("RTSP_USE_TCP", "1") == "1":
     os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "rtsp_transport;tcp")
@@ -20,6 +21,8 @@ import csv
 import json
 import threading
 import time
+import json as json_module
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
@@ -28,6 +31,9 @@ from urllib.parse import quote
 import cv2
 import numpy as np
 from insightface.app import FaceAnalysis
+
+from collections import Counter, deque
+from insightface.app.common import Face
 
 
 # ============================================================
@@ -51,10 +57,17 @@ DET_SIZES = [(640, 640), (960, 960), (1280, 1280)]  # tombol D memutar ukuran in
 DET_SIZE_INDEX = 0
 DET_THRESH = 0.45
 
+EMBED_MIN_INTERVAL = 0.25
+
 # Pencocokan
 SIMILARITY_THRESHOLD = 0.50
-MIN_CONFIRMATIONS = 3     # berapa kali berturut-turut nama yang sama
-MIN_FACE_SIZE = 40        # piksel (sisi terpendek kotak wajah)
+VOTE_WINDOW = 5           # jendela voting (frame yang di-embed)
+MIN_CONFIRMATIONS = 3     # nama yang sama minimal sekian kali dalam jendela
+MIN_FACE_SIZE = 40
+
+# Efisiensi
+RECHECK_INTERVAL = 2.0    # detik; re-verifikasi identitas yang sudah sah
+LOG_COOLDOWN = 60.0   
 
 # Tracker wajah sederhana (pengganti track_id YOLO)
 TRACK_IOU_MIN = 0.20
@@ -73,6 +86,8 @@ FIRST_FRAME_TIMEOUT = 20.0
 PANEL_WIDTH = int(os.getenv("PANEL_WIDTH", "1280"))
 UI_FPS = 30
 WINDOW_NAME = "FACE RECOGNITION ONLY"
+
+MIN_MARGIN = 0.05
 
 STOP_EVENT = threading.Event()
 
@@ -117,16 +132,27 @@ class FaceDatabase:
         norms = np.linalg.norm(emb, axis=1, keepdims=True)
         self.embeddings = emb / np.maximum(norms, 1e-9)
         self.names = names
+        
+        self.people = sorted(set(names))
+        index = {p: i for i, p in enumerate(self.people)}
+        self.owner = np.array([index[n] for n in names])
 
         print(f"[DB] {len(set(names))} orang, {len(names)} embedding")
 
     def match(self, embedding):
-        """Kembalikan (nama_terbaik, similarity). Nama tidak dipotong threshold."""
+        """Kembalikan (nama, similarity, margin) per ORANG, bukan per embedding."""
 
         emb = embedding / max(float(np.linalg.norm(embedding)), 1e-9)
         sims = self.embeddings @ emb
-        best = int(np.argmax(sims))
-        return self.names[best], float(sims[best])
+
+        per_person = np.full(len(self.people), -1.0, dtype=np.float32)
+        np.maximum.at(per_person, self.owner, sims)
+
+        order = np.argsort(per_person)[::-1]
+        best = per_person[order[0]]
+        second = per_person[order[1]] if len(order) > 1 else -1.0
+
+        return self.people[order[0]], float(best), float(best - second)
 
 
 # ============================================================
@@ -175,11 +201,13 @@ class FaceTrack:
         self.id = track_id
         self.box = box
         self.last_seen = stamp
-        self.name = None          # identitas sah
+        self.name = None
         self.similarity = 0.0
-        self.candidate = None
-        self.streak = 0
+        self.votes = deque(maxlen=VOTE_WINDOW)
         self.mismatch = 0
+        self.last_verified = 0.0
+        self.best = ""
+        self.sim_last = 0.0
 
 
 class FaceTracker:
@@ -260,6 +288,9 @@ class CameraState:
         self.last_error = ""
         self.fps = 0.0
         self.faces_in_frame = 0
+        
+        self.t_det = 0.0
+        self.t_emb = 0.0
 
     def get_view(self):
         with self.lock:
@@ -362,9 +393,11 @@ def capture_worker(cam):
 # ============================================================
 
 def face_worker(cam, app, db):
-    global SIMILARITY_THRESHOLD
+    det_model = app.models["detection"]
+    rec_model = app.models["recognition"]
 
     tracker = FaceTracker()
+    last_logged = {}
     previous = time.monotonic()
 
     while not STOP_EVENT.is_set():
@@ -384,74 +417,91 @@ def face_worker(cam, app, db):
         faces_out = []
 
         try:
-            faces = app.get(frame)
+            t0 = time.perf_counter()
+            bboxes, kpss = det_model.detect(frame, max_num=0, metric="default")
+            cam.t_det = 0.9 * cam.t_det + 0.1 * (time.perf_counter() - t0)
             stamp = time.monotonic()
 
-            boxes, embeddings, scores = [], [], []
-
-            for face in faces:
-                x1, y1, x2, y2 = [int(v) for v in face.bbox]
+            boxes, dets = [], []
+            for i in range(bboxes.shape[0]):
+                x1, y1, x2, y2 = [int(v) for v in bboxes[i, :4]]
 
                 if min(x2 - x1, y2 - y1) < MIN_FACE_SIZE:
                     continue
-                if face.normed_embedding is None:
+                if kpss is None:
                     continue
 
                 boxes.append((x1, y1, x2, y2))
-                embeddings.append(face.normed_embedding)
-                scores.append(float(face.det_score))
+                dets.append((bboxes[i, :4], kpss[i], float(bboxes[i, 4])))
 
             tracks = tracker.update(boxes, stamp)
 
-            for track, emb, score in zip(tracks, embeddings, scores):
-                name, sim = db.match(emb)
-                matched = name if sim >= SIMILARITY_THRESHOLD else None
+            for track, (bbox, kps, score) in zip(tracks, dets):
+                interval = (
+                    EMBED_MIN_INTERVAL if track.name is None else RECHECK_INTERVAL
+                )
+                needs_check = stamp - track.last_verified >= interval
 
-                if track.name is None:
-                    # Voting: nama yang sama beberapa kali berturut-turut
-                    if matched is not None and matched == track.candidate:
-                        track.streak += 1
-                    elif matched is not None:
-                        track.candidate = matched
-                        track.streak = 1
+                if needs_check:
+                    face = Face(bbox=bbox, kps=kps, det_score=score)
+
+                    t0 = time.perf_counter()
+                    emb = rec_model.get(frame, face)
+                    cam.t_emb = 0.9 * cam.t_emb + 0.1 * (time.perf_counter() - t0)
+
+                    name, sim, margin = db.match(emb)
+                    matched = (
+                        name
+                        if sim >= SIMILARITY_THRESHOLD and margin >= MIN_MARGIN
+                        else None
+                    )
+
+                    track.last_verified = stamp
+                    track.best = name
+                    track.sim_last = sim
+
+                    if track.name is None:
+                        track.votes.append(matched)
+                        counts = Counter(v for v in track.votes if v)
+
+                        if counts:
+                            top, n = counts.most_common(1)[0]
+
+                            if n >= MIN_CONFIRMATIONS:
+                                track.name = top
+                                track.similarity = sim
+                                track.mismatch = 0
+                                track.last_verified = stamp + random.uniform(0.0, 1.0)
+
+                                if stamp - last_logged.get(top, -1e9) >= LOG_COOLDOWN:
+                                    last_logged[top] = stamp
+                                    print(
+                                        f"[FACE RECOGNIZED] {datetime.now():%H:%M:%S} | "
+                                        f"{CAMERA_LABEL} | ID={track.id} | NAME={top} "
+                                        f"| SIM={sim:.2f}"
+                                    )
+                                    write_face_log(track.id, top)
+
                     else:
-                        track.candidate = None
-                        track.streak = 0
-
-                    if matched is not None and track.streak >= MIN_CONFIRMATIONS:
-                        track.name = matched
-                        track.similarity = sim
-                        track.mismatch = 0
-
-                        print(
-                            f"[FACE RECOGNIZED] {datetime.now():%H:%M:%S} | "
-                            f"{CAMERA_LABEL} | ID={track.id} | NAME={matched} "
-                            f"| SIM={sim:.2f}"
-                        )
-                        write_face_log(track.id, matched)
-
-                else:
-                    # Identitas sudah sah; lepas kalau terus-menerus cocok
-                    # ke orang lain (tracker wajah tertukar).
-                    if matched == track.name:
-                        track.mismatch = 0
-                        track.similarity = sim
-                    elif matched is not None:
-                        track.mismatch += 1
-
-                        if track.mismatch >= RECHECK_MISMATCH_LIMIT:
-                            track.name = None
-                            track.candidate = matched
-                            track.streak = 1
+                        if matched == track.name:
                             track.mismatch = 0
+                            track.similarity = sim
+                        elif matched is not None:
+                            track.mismatch += 1
+
+                            if track.mismatch >= RECHECK_MISMATCH_LIMIT:
+                                track.name = None
+                                track.votes.clear()
+                                track.votes.append(matched)
+                                track.mismatch = 0
 
                 faces_out.append(
                     {
                         "box": track.box,
                         "id": track.id,
                         "name": track.name,
-                        "sim": sim,
-                        "best": name,
+                        "sim": track.sim_last,
+                        "best": track.best,
                         "det": score,
                     }
                 )
@@ -515,6 +565,7 @@ def render(cam, view, det_size):
     header = (
         f"FACE ONLY | FPS {cam.fps:.0f} | wajah {cam.faces_in_frame} | "
         f"det {det_size[0]} | thr {SIMILARITY_THRESHOLD:.2f}"
+        f"det {cam.t_det*1000:.0f}ms emb {cam.t_emb*1000:.0f}ms | "
     )
     cv2.putText(frame, header, (10, int(26 * scale)),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7 * scale, (255, 255, 255),
@@ -535,7 +586,164 @@ def render(cam, view, det_size):
 
 
 # ============================================================
-# 8. PROGRAM UTAMA
+# 8. HTTP VIEWER SERVICE
+# ============================================================
+
+VIEWER_HOST = os.getenv("FACE_VIEWER_HOST", "0.0.0.0")
+VIEWER_PORT = int(os.getenv("FACE_VIEWER_PORT", "8081"))
+STREAM_FPS = max(1, int(os.getenv("FACE_STREAM_FPS", "12")))
+JPEG_QUALITY = max(40, min(95, int(os.getenv("FACE_JPEG_QUALITY", "80"))))
+
+
+def build_face_status(cam, det_size):
+    """Status ringkas untuk dashboard monitoring."""
+    view = cam.get_view()
+    faces = view[2] if view and len(view) >= 3 else []
+
+    return {
+        "service": "face-recognition",
+        "camera_id": CAMERA_ID,
+        "camera_label": CAMERA_LABEL,
+        "camera_connected": bool(cam.camera_ok),
+        "camera_error": cam.last_error,
+        "fps": round(float(cam.fps), 2),
+        "faces_detected": len(faces),
+        "recognized_count": sum(1 for face in faces if face.get("name")),
+        "det_ms": round(float(cam.t_det) * 1000, 2),
+        "embedding_ms": round(float(cam.t_emb) * 1000, 2),
+        "model": MODEL_PACK,
+        "gpu_id": GPU_ID,
+        "det_size": list(det_size),
+        "similarity_threshold": float(SIMILARITY_THRESHOLD),
+        "stream_fps": STREAM_FPS,
+        "faces": [
+            {
+                "id": int(face["id"]),
+                "name": face.get("name"),
+                "similarity": round(float(face.get("sim", 0.0)), 4),
+                "detection_score": round(float(face.get("det", 0.0)), 4),
+                "box": [int(v) for v in face.get("box", [])],
+            }
+            for face in faces
+        ],
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+    }
+
+
+class FaceViewerHandler(BaseHTTPRequestHandler):
+    cam = None
+    det_size = (960, 960)
+
+    def _send_json(self, payload, status=200):
+        body = json_module.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.end_headers()
+
+    def do_GET(self):
+
+        # Pisahkan path dari query parameter.
+        path = self.path.split("?", 1)[0]
+
+        if path in ("/", "/health"):
+            self._send_json({
+                "ok": True,
+                "service": "face-recognition",
+                "camera_connected": bool(self.cam.camera_ok),
+                "port": VIEWER_PORT,
+            })
+            return
+
+        if path == "/api/status":
+            self._send_json(
+                build_face_status(self.cam, self.det_size)
+            )
+            return
+
+        if path == "/stream":
+            self._serve_stream()
+            return
+
+        self._send_json(
+            {"error": "Not found"},
+            status=404
+        )
+
+    def _serve_stream(self):
+        self.send_response(200)
+        self.send_header(
+            "Content-Type",
+            "multipart/x-mixed-replace; boundary=frame",
+        )
+        self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+        self.send_header("Pragma", "no-cache")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+
+        frame_interval = 1.0 / STREAM_FPS
+        last_frame_id = -1
+
+        try:
+            while not STOP_EVENT.is_set():
+                started = time.perf_counter()
+                view = self.cam.get_view()
+
+                if view is None or view[1] is None:
+                    time.sleep(0.1)
+                    continue
+
+                frame_id, _, _ = view
+                if frame_id == last_frame_id:
+                    time.sleep(0.02)
+                    continue
+
+                rendered = render(self.cam, view, self.det_size)
+                ok, encoded = cv2.imencode(
+                    ".jpg",
+                    rendered,
+                    [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY],
+                )
+
+                if not ok:
+                    time.sleep(0.05)
+                    continue
+
+                payload = encoded.tobytes()
+                self.wfile.write(b"--frame\r\n")
+                self.wfile.write(b"Content-Type: image/jpeg\r\n")
+                self.wfile.write(f"Content-Length: {len(payload)}\r\n\r\n".encode())
+                self.wfile.write(payload)
+                self.wfile.write(b"\r\n")
+                self.wfile.flush()
+                last_frame_id = frame_id
+
+                remaining = frame_interval - (time.perf_counter() - started)
+                if remaining > 0:
+                    time.sleep(remaining)
+
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            pass
+        except Exception as error:
+            print(f"[FACE STREAM ERROR] {error}")
+
+    def log_message(self, format, *args):
+        # Kurangi noise log setiap browser melakukan polling/stream.
+        return
+
+
+# ============================================================
+# 9. PROGRAM UTAMA
 # ============================================================
 
 def prepare_app(det_size):
@@ -544,9 +752,18 @@ def prepare_app(det_size):
         if GPU_ID >= 0 else ["CPUExecutionProvider"]
     )
 
-    app = FaceAnalysis(name=MODEL_PACK, providers=providers,
-                       allowed_modules=["detection", "recognition"])
+    app = FaceAnalysis(
+        name=MODEL_PACK,
+        providers=providers,
+        allowed_modules=["detection", "recognition"],
+    )
     app.prepare(ctx_id=GPU_ID, det_size=det_size, det_thresh=DET_THRESH)
+
+    for model_name, model in app.models.items():
+        session = getattr(model, "session", None)
+        if session is not None:
+            print(f"[INFO] Provider {model_name}: {session.get_providers()}")
+
     return app
 
 
@@ -572,86 +789,66 @@ def main():
         return
 
     print("=" * 60)
-    print("FACE RECOGNITION ONLY (tanpa YOLO)")
-    print(f"Model: {MODEL_PACK} | det_size: {DET_SIZES[DET_SIZE_INDEX]} | "
-          f"threshold: {SIMILARITY_THRESHOLD}")
+    print("FACE RECOGNITION HTTP SERVICE")
+    print(f"Model: {MODEL_PACK} | det_size: {DET_SIZES[DET_SIZE_INDEX]} | threshold: {SIMILARITY_THRESHOLD}")
+    print(f"Viewer: http://localhost:{VIEWER_PORT}")
     print("=" * 60)
 
     cam = CameraState(url)
-
     threads = [
-        threading.Thread(target=capture_worker, args=(cam,), daemon=True),
-        threading.Thread(target=face_worker, args=(cam, app, db), daemon=True),
+        threading.Thread(target=capture_worker, args=(cam,), daemon=True, name="FaceCapture"),
+        threading.Thread(target=face_worker, args=(cam, app, db), daemon=True, name="FaceInference"),
     ]
-    for t in threads:
-        t.start()
+
+    for thread in threads:
+        thread.start()
 
     start = time.monotonic()
-    while time.monotonic() - start < FIRST_FRAME_TIMEOUT and cam.frame is None:
+    while time.monotonic() - start < FIRST_FRAME_TIMEOUT:
+        with cam.lock:
+            has_frame = cam.frame is not None
+        if has_frame:
+            break
+        if STOP_EVENT.is_set():
+            break
         time.sleep(0.1)
 
-    if cam.frame is None:
+    with cam.lock:
+        has_frame = cam.frame is not None
+
+    if not has_frame:
         STOP_EVENT.set()
+        for thread in threads:
+            thread.join(timeout=3)
         print(f"[ERROR] CCTV tidak mengirim frame dalam {FIRST_FRAME_TIMEOUT:.0f} detik")
         return
 
-    cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+    handler = type(
+        "ConfiguredFaceViewerHandler",
+        (FaceViewerHandler,),
+        {"cam": cam, "det_size": DET_SIZES[DET_SIZE_INDEX]},
+    )
 
-    print("KONTROL: Q keluar | [ / ] threshold -/+ 0.02 | D ganti ukuran deteksi")
-
-    last_id = -1
-    shown = None
+    server = ThreadingHTTPServer((VIEWER_HOST, VIEWER_PORT), handler)
+    server.daemon_threads = True
 
     try:
-        while True:
-            loop_start = time.perf_counter()
-            view = cam.get_view()
-
-            if view[0] != last_id or shown is None:
-                shown = render(cam, view, DET_SIZES[DET_SIZE_INDEX])
-                last_id = view[0]
-
-            cv2.imshow(WINDOW_NAME, shown)
-
-            spare = 1.0 / UI_FPS - (time.perf_counter() - loop_start)
-            key = cv2.waitKey(max(1, int(spare * 1000))) & 0xFF
-
-            if cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
-                break
-
-            if key in (ord("q"), ord("Q")):
-                break
-
-            elif key == ord("["):
-                SIMILARITY_THRESHOLD = max(0.20, SIMILARITY_THRESHOLD - 0.02)
-                last_id = -1
-                print(f"[CONFIG] Threshold {SIMILARITY_THRESHOLD:.2f}")
-
-            elif key == ord("]"):
-                SIMILARITY_THRESHOLD = min(0.90, SIMILARITY_THRESHOLD + 0.02)
-                last_id = -1
-                print(f"[CONFIG] Threshold {SIMILARITY_THRESHOLD:.2f}")
-
-            elif key in (ord("d"), ord("D")):
-                DET_SIZE_INDEX = (DET_SIZE_INDEX + 1) % len(DET_SIZES)
-                size = DET_SIZES[DET_SIZE_INDEX]
-
-                # Ganti ukuran deteksi tanpa memuat ulang model.
-                app.det_model.input_size = size
-                last_id = -1
-                print(f"[CONFIG] Ukuran deteksi wajah {size}")
+        print("[FACE] HTTP service aktif.")
+        print(f"[FACE] Status : http://localhost:{VIEWER_PORT}/api/status")
+        print(f"[FACE] Stream : http://localhost:{VIEWER_PORT}/stream")
+        server.serve_forever(poll_interval=0.5)
 
     except KeyboardInterrupt:
         print("[INFO] Dihentikan dari keyboard.")
 
     finally:
         STOP_EVENT.set()
+        server.server_close()
 
-        for t in threads:
-            t.join(timeout=3)
+        for thread in threads:
+            thread.join(timeout=3)
 
-        cv2.destroyAllWindows()
-        print("[INFO] Face recognition dihentikan.")
+        print("[INFO] Face Recognition Service dihentikan.")
 
 
 if __name__ == "__main__":

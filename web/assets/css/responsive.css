@@ -1,0 +1,145 @@
+/* =========================================
+   RESPONSIVE LAYOUT
+========================================= */
+
+/* Laptop and smaller desktop */
+@media (max-width: 1200px) {
+  main#dashboard {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .dashboard-aside {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    align-items: start;
+  }
+
+  .dashboard-aside > section:last-child {
+    grid-column: 1 / -1;
+  }
+}
+
+/* Tablet */
+@media (max-width: 900px) {
+  header {
+    padding-right: 16px;
+    padding-left: 16px;
+  }
+
+  main#dashboard {
+    gap: 16px;
+    padding: 16px;
+  }
+
+  .header-right {
+    gap: 12px;
+  }
+
+  #clock {
+    font-size: 0.8rem;
+  }
+}
+
+/* Mobile: sidebar remains fixed at 240px.
+   Main content uses the remaining viewport width. */
+@media (max-width: 700px) {
+  header {
+    min-height: 64px;
+    padding: 10px 12px;
+  }
+
+  .header-title small {
+    display: none;
+  }
+
+  .header-title h1 {
+    font-size: 1rem;
+  }
+
+  .header-right {
+    gap: 9px;
+  }
+
+  .conn {
+    gap: 6px;
+    font-size: 0.72rem;
+  }
+
+  .dot {
+    width: 8px;
+    height: 8px;
+    flex-basis: 8px;
+  }
+
+  #clock {
+    display: none;
+  }
+
+  main#dashboard {
+    gap: 14px;
+    padding: 14px 12px;
+  }
+
+  .dashboard-aside {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 14px;
+  }
+
+  .dashboard-aside > section:last-child {
+    grid-column: auto;
+  }
+
+  section {
+    padding: 14px;
+  }
+
+  .big {
+    font-size: 1.35rem;
+  }
+
+  .logwrap {
+    max-height: 300px;
+  }
+}
+
+/* Very narrow viewport */
+@media (max-width: 420px) {
+  header {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .header-right {
+    width: 100%;
+    justify-content: flex-start;
+  }
+
+  main#dashboard {
+    padding: 10px 8px;
+  }
+
+  .well {
+    border-radius: 4px;
+  }
+
+  .logwrap table {
+    font-size: 0.82rem;
+  }
+}
+
+/* Reduced motion */
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+  }
+}

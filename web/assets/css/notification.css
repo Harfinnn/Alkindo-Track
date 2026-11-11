@@ -1,0 +1,351 @@
+
+/* =========================================
+   GATEWATCH NOTIFICATION
+========================================= */
+
+.notification-container {
+  position: fixed;
+  top: 24px;
+  right: 24px;
+  z-index: 9999;
+
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+
+  width: min(380px, calc(100vw - 32px));
+  pointer-events: none;
+}
+
+.notification {
+  display: flex;
+  align-items: flex-start;
+  gap: 13px;
+
+  padding: 16px;
+  background: #ffffff;
+
+  border: 1px solid #e5e7eb;
+  border-left: 4px solid #0f766e;
+  border-radius: 12px;
+
+  box-shadow:
+    0 10px 25px rgba(15, 23, 42, 0.08),
+    0 3px 8px rgba(15, 23, 42, 0.04);
+
+  pointer-events: auto;
+
+  animation: notification-in 0.3s ease forwards;
+}
+
+.notification.success {
+  border-left-color: #16a34a;
+}
+
+.notification.error {
+  border-left-color: #dc2626;
+}
+
+.notification.warning {
+  border-left-color: #d97706;
+}
+
+.notification.info {
+  border-left-color: #0f766e;
+}
+
+.notification-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+
+  width: 34px;
+  height: 34px;
+  flex-shrink: 0;
+
+  border-radius: 9px;
+  font-size: 17px;
+  font-weight: 700;
+}
+
+.notification.success .notification-icon {
+  color: #16a34a;
+  background: #dcfce7;
+}
+
+.notification.error .notification-icon {
+  color: #dc2626;
+  background: #fee2e2;
+}
+
+.notification.warning .notification-icon {
+  color: #d97706;
+  background: #fef3c7;
+}
+
+.notification.info .notification-icon {
+  color: #0f766e;
+  background: #ccfbf1;
+}
+
+.notification-content {
+  flex: 1;
+  min-width: 0;
+}
+
+.notification-title {
+  margin: 0 0 5px;
+  color: #111827;
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.notification-message {
+  margin: 0;
+  color: #64748b;
+  font-size: 13px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.notification-close {
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: #94a3b8;
+
+  font-size: 19px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.notification-close:hover {
+  color: #334155;
+}
+
+.notification-progress {
+  height: 3px;
+  margin-top: 12px;
+  overflow: hidden;
+  background: #f1f5f9;
+  border-radius: 10px;
+}
+
+.notification-progress-bar {
+  height: 100%;
+  width: 100%;
+  background: #0f766e;
+  transform-origin: left;
+  animation: notification-progress linear forwards;
+}
+
+.notification.success .notification-progress-bar {
+  background: #16a34a;
+}
+
+.notification.error .notification-progress-bar {
+  background: #dc2626;
+}
+
+.notification.warning .notification-progress-bar {
+  background: #d97706;
+}
+
+.notification.removing {
+  animation: notification-out 0.25s ease forwards;
+}
+
+@keyframes notification-in {
+  from {
+    opacity: 0;
+    transform: translateX(25px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+@keyframes notification-out {
+  to {
+    opacity: 0;
+    transform: translateX(25px);
+  }
+}
+
+@keyframes notification-progress {
+  from {
+    transform: scaleX(1);
+  }
+
+  to {
+    transform: scaleX(0);
+  }
+}
+
+@media (max-width: 480px) {
+  .notification-container {
+    top: 12px;
+    right: 12px;
+    width: calc(100vw - 24px);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .notification,
+  .notification.removing,
+  .notification-progress-bar {
+    animation: none;
+  }
+}
+
+
+/* =========================================
+   CONFIRMATION DIALOG
+========================================= */
+
+.confirmation-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 10000;
+
+    display: flex;
+    align-items: center;
+    justify-content: center;
+
+    padding: 20px;
+    background: rgba(15, 23, 42, 0.48);
+    backdrop-filter: blur(3px);
+
+    animation: confirmation-fade 0.2s ease;
+}
+
+.confirmation-dialog {
+    width: 100%;
+    max-width: 400px;
+
+    padding: 28px;
+    text-align: center;
+
+    background: #ffffff;
+    border: 1px solid #e5e7eb;
+    border-radius: 16px;
+
+    box-shadow: 0 20px 50px rgba(15, 23, 42, 0.18);
+
+    animation: confirmation-appear 0.25s ease;
+}
+
+.confirmation-icon {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+
+    width: 52px;
+    height: 52px;
+    margin: 0 auto 18px;
+
+    border-radius: 50%;
+    background: #fef3c7;
+    color: #d97706;
+
+    font-size: 24px;
+    font-weight: 700;
+}
+
+.confirmation-dialog h3 {
+    margin: 0 0 10px;
+    color: #111827;
+    font-size: 18px;
+    font-weight: 700;
+}
+
+.confirmation-dialog p {
+    margin: 0;
+    color: #64748b;
+    font-size: 14px;
+    line-height: 1.6;
+}
+
+.confirmation-actions {
+    display: flex;
+    justify-content: center;
+    gap: 10px;
+    margin-top: 26px;
+}
+
+.confirmation-actions button {
+    min-height: 42px;
+    padding: 0 18px;
+
+    border: none;
+    border-radius: 8px;
+
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+
+    transition: background 0.2s ease;
+}
+
+.confirmation-cancel {
+    color: #475569;
+    background: #f1f5f9;
+}
+
+.confirmation-cancel:hover {
+    background: #e2e8f0;
+}
+
+.confirmation-confirm {
+    color: #ffffff;
+    background: #0f766e;
+}
+
+.confirmation-confirm:hover {
+    background: #115e59;
+}
+
+.confirmation-dialog.error .confirmation-icon {
+    color: #dc2626;
+    background: #fee2e2;
+}
+
+.confirmation-dialog.error .confirmation-confirm {
+    background: #dc2626;
+}
+
+.confirmation-dialog.error .confirmation-confirm:hover {
+    background: #b91c1c;
+}
+
+@keyframes confirmation-fade {
+    from { opacity: 0; }
+    to { opacity: 1; }
+}
+
+@keyframes confirmation-appear {
+    from {
+        opacity: 0;
+        transform: translateY(10px) scale(0.97);
+    }
+    to {
+        opacity: 1;
+        transform: translateY(0) scale(1);
+    }
+}
+
+@media (max-width: 480px) {
+    .confirmation-dialog {
+        padding: 24px 18px;
+    }
+
+    .confirmation-actions {
+        flex-direction: column-reverse;
+    }
+
+    .confirmation-actions button {
+        width: 100%;
+    }
+}

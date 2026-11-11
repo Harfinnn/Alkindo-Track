@@ -1,1736 +1,334 @@
-import os
+"""
+FACE RECOGNITION ONLY (tanpa YOLO / ByteTrack)
 
-# RTSP lewat TCP (tidak ada paket hilang). Harus diatur sebelum import cv2.
-# RTSP_USE_TCP=0 memakai UDP bawaan FFmpeg, seperti skrip dual CCTV gerbang
-# (lebih ringan; kalau gambar pecah/artefak, kembalikan ke 1).
+Alur:
+  capture thread  -> frame terbaru
+  face thread     -> InsightFace deteksi wajah di FRAME PENUH -> embedding
+                     -> cocokkan dengan database -> tracker wajah sederhana
+                     -> voting beberapa frame -> identitas sah -> log CSV
+  UI (main)       -> gambar kotak wajah + nama
+
+Kontrol: Q keluar | [ / ] turunkan / naikkan threshold | D ganti ukuran deteksi
+"""
+
+import os
+import random
+
 if os.getenv("RTSP_USE_TCP", "1") == "1":
-    os.environ.setdefault(
-        "OPENCV_FFMPEG_CAPTURE_OPTIONS",
-        "rtsp_transport;tcp",
-    )
+    os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "rtsp_transport;tcp")
 
 import csv
 import json
-import math
-import queue
 import threading
 import time
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote
 
-from modules.face_recognition.face_engine import FaceEngine
-from modules.face_recognition.face_matcher import FaceMatcher
-from modules.face_recognition.face_worker import FaceWorker
-
 import cv2
 import numpy as np
-import torch
-from ultralytics import YOLO
+from insightface.app import FaceAnalysis
+
+from collections import Counter, deque
+from insightface.app.common import Face
 
 
 # ============================================================
-# 1. KONFIGURASI UTAMA
+# 1. KONFIGURASI
 # ============================================================
 
-# --- Kamera ---
-# Pintu 1-3 ada di kamera LANTAI1 (lobby). Pintu 4 (tangga) di LANTAI2.1,
-# Pintu 5 (office) dan 6 (meeting 2) di LANTAI2.2.
-# Urutan di dict ini = urutan panel (kiri ke kanan, lalu baris berikutnya).
-
-CAMERAS = {
-    "LANTAI1": {
-        "env": "ANPR_RTSP_LANTAI1",
-        "label": "CCTV-LANTAI1",
-        "title": "LANTAI 1",
-    },
-    # "LANTAI2.1": {
-    #     "env": "ANPR_RTSP_LANTAI2_CCTV1",
-    #     "label": "CCTV1-LANTAI2",
-    #     "title": "LANTAI 2 (TANGGA)",
-    # },
-    # "LANTAI2.2": {
-    #     "env": "ANPR_RTSP_LANTAI2_CCTV2",
-    #     "label": "CCTV2-LANTAI2",
-    #     "title": "LANTAI 2",
-    # },
-}
-
-# Jumlah panel per baris. 3 kamera -> 2 di atas, 1 di bawah.
-COLUMNS = 1
-
-# Nama kamera lama di file konfigurasi garis -> nama kamera sekarang.
-CAMERA_ALIASES = {"LANTAI2": "LANTAI2.1"}
-
-# Panel info (okupansi semua area) digambar di panel kamera ini.
-INFO_PANEL_CAMERA = "LANTAI1"
-
-# --- Thread CPU (diatur sebelum model YOLO dibuat) ---
-CPU_THREADS = 8
-
-torch.set_num_threads(CPU_THREADS)
-cv2.setNumThreads(CPU_THREADS)
-
-# --- Model dan tracker ---
 BASE_DIR = Path(__file__).resolve().parent
-MODEL_PATH = os.getenv("YOLO_MODEL_PATH", str(BASE_DIR / "models" / "yolo11l.pt"))
 
+CAMERA_ID = "LANTAI1"
+CAMERA_LABEL = "CCTV-LANTAI1"
+CAMERA_CONFIG_FILE = BASE_DIR / "config" / "cameras.json"
+CAMERA_GROUP = "OFFICE"
 
-# ============================================================
-# FACE RECOGNITION
-# ============================================================
+FACE_DATABASE = BASE_DIR / "database" / "face_database_arcface.npz"
+FACE_LOG_FILE = BASE_DIR / "logs" / "lobby" / "face_recognition_log.csv"
 
-FACE_CAMERA_ID = "LANTAI1"
+# InsightFace
+MODEL_PACK = os.getenv("FACE_MODEL", "buffalo_l")
+GPU_ID = int(os.getenv("FACE_GPU", "0"))          # -1 = CPU
+DET_SIZES = [(960, 960), (1280, 1280)]  # tombol D memutar ukuran ini
+DET_SIZE_INDEX = 0
+DET_THRESH = 0.45
 
-FACE_DATABASE = (
-    BASE_DIR / "database" / "face_database.npz"
-)
+EMBED_MIN_INTERVAL = 0.25
 
-FACE_SIMILARITY_THRESHOLD = 0.45
-FACE_MIN_CONFIRMATIONS = 3
-FACE_MIN_DETECTION_SCORE = 0.45
-FACE_MIN_SIZE = 20
+# Pencocokan
+SIMILARITY_THRESHOLD = 0.50
+VOTE_WINDOW = 5           # jendela voting (frame yang di-embed)
+MIN_CONFIRMATIONS = 3     # nama yang sama minimal sekian kali dalam jendela
+MIN_FACE_SIZE = 40
 
-# Ukuran input detektor wajah. Makin kecil makin cepat; crop kepala
-# sudah kecil, jadi 320 cukup. Naikkan ke 640 kalau wajah sering terlewat.
-FACE_DET_SIZE = (320, 320)
+# Efisiensi
+RECHECK_INTERVAL = 2.0    # detik; re-verifikasi identitas yang sudah sah
+LOG_COOLDOWN = 60.0   
 
-FACE_ENGINE = None
-FACE_MATCHER = None
-FACE_WORKER = None
+# Tracker wajah sederhana (pengganti track_id YOLO)
+TRACK_IOU_MIN = 0.20
+TRACK_MAX_CENTER_DIST = 0.6   # x lebar wajah
+TRACK_LOST_SECONDS = 2.0
 
-FACE_LOG_FILE = (
-    BASE_DIR / "logs" / "lobby" / "face_recognition_log.csv"
-)
+# Re-verifikasi identitas yang sudah sah (deteksi salah orang)
+RECHECK_MISMATCH_LIMIT = 5
 
-# OpenVINO: lebih cepat di CPU Intel. Set YOLO_USE_OPENVINO=0 untuk
-# kembali ke model .pt. Kalau IMGSZ diubah, hapus folder *_openvino_model
-# supaya diexport ulang dengan ukuran baru.
-USE_OPENVINO = os.getenv("YOLO_USE_OPENVINO", "1") == "1"
-
-# Device OpenVINO: "intel:gpu" (iGPU, tercepat di i3-1215U) atau "intel:cpu".
-# Kalau iGPU gagal, otomatis turun ke "intel:cpu".
-INFERENCE_DEVICE = os.getenv("YOLO_DEVICE", "intel:gpu")
-TRACKER_CONFIG = str(BASE_DIR / "config" / "custom_bytetrack_stable.yaml")
-
-IMGSZ = 960
-
-# Batas atas laju deteksi per kamera. Laju sebenarnya otomatis mengikuti
-# kecepatan YOLO: frame baru hanya diambil kalau YOLO sedang menganggur,
-# jadi tidak ada konversi warna / resize yang terbuang.
-INFERENCE_MAX_FPS = 15
-PERSON_CLASS_ID = 0
-CONFIDENCE = 0.15
-
-# --- Kamera ---
+# Kamera
 RECONNECT_DELAY = 2.0
+CAPTURE_TIMEOUT_MS = 8000
 FIRST_FRAME_TIMEOUT = 20.0
 
-# Batas waktu buka / baca RTSP (ms). Tanpa ini grab() bisa menggantung
-# selamanya kalau stream membeku. Perlu OpenCV 4.5.2+; kalau tidak ada,
-# otomatis dilewati.
-CAPTURE_TIMEOUT_MS = 8000
-
-# --- Tampilan ---
-# Frame kamera dikecilkan SEKALI di thread capture tepat ke ukuran panel
-# (INTER_AREA). Kotak, garis, dan teks digambar langsung di ukuran itu, dan
-# jendela dibuat persis seukuran kanvas, jadi tidak ada resize kedua yang
-# membuat gambar buram.
-# Default 640x360 per panel (sama dengan human_tracking_dual_cctv.py).
-# Mau lebih besar, misalnya:
-#   PowerShell: $env:PANEL_WIDTH = "960"; $env:PANEL_HEIGHT = "540"
-PANEL_WIDTH = int(os.getenv("PANEL_WIDTH", "640"))
-PANEL_HEIGHT = int(os.getenv("PANEL_HEIGHT", "360"))
-
-# Semua koordinat garis memakai ukuran ini.
-DISPLAY_WIDTH = PANEL_WIDTH
-DISPLAY_HEIGHT = PANEL_HEIGHT
-
+# Tampilan
+PANEL_WIDTH = int(os.getenv("PANEL_WIDTH", "1280"))
 UI_FPS = 30
-WINDOW_NAME = "LOBBY PEOPLE TRACKING"
+WINDOW_NAME = "FACE RECOGNITION ONLY"
 
-# --- File ---
-CAMERA_CONFIG_FILE = BASE_DIR / "config" / "cameras.json"
-CONFIG_FILE = BASE_DIR / "config" / "lobby_tracking_config.json"
-LOG_FILE = BASE_DIR / "logs" / "lobby" / "lobby_occupancy_log.csv"
-TRACK_LOG_FILE = BASE_DIR / "logs" / "lobby" / "lobby_track_log.csv"
-TRACK_SUMMARY_INTERVAL = 60.0
-TRACK_ACTIVE_WINDOW = 2.5  # track dianggap aktif jika terlihat dalam 2,5 detik terakhir
-STATE_FILE = BASE_DIR / "data" / "lobby_state.json"
-
-# --- State okupansi ---
-STATE_SAVE_INTERVAL = 5.0  # detik, simpan berkala
-AUTO_RESET_HOUR = 0        # reset otomatis mulai jam ini; None = nonaktif
-
-# --- Penghitungan ---
-CROSSING_MARGIN_RATIO = 0.008  # sekitar 0,8% lebar frame
-COUNT_COOLDOWN = 1.0
-MAX_TRACK_LOST_SECONDS = 30
-
-# Ukuran kerja tiap kamera; diperbarui otomatis dari frame pertama.
-FRAME_SIZES = {
-    camera_id: (DISPLAY_WIDTH, DISPLAY_HEIGHT) for camera_id in CAMERAS
-}
-
-# Posisi dan ukuran tiap panel di jendela gabungan; diisi saat start.
-# {camera_id: {"x": offset_x, "y": offset_y, "w": lebar, "h": tinggi}}
-VIEWS = {}
-CANVAS_WIDTH = PANEL_WIDTH * min(COLUMNS, len(CAMERAS))
-CANVAS_HEIGHT = PANEL_HEIGHT * math.ceil(len(CAMERAS) / COLUMNS)
-
-
-# ============================================================
-# 2. DEFINISI PINTU DAN DATA
-# ============================================================
-
-# "camera" = kamera tempat garis pintu ini digambar dan dihitung.
-# label_neg / label_pos = teks di sisi negatif / positif garis.
-DOORS = {
-    1: {
-        "name": "PINTU KELUAR",
-        "camera": "LANTAI1",
-        "color": (0, 220, 255),
-        "line": None,
-        "reverse": False,
-        "label_neg": "OUT",
-        "label_pos": "IN",
-    },
-    2: {
-        "name": "AREA PRODUKSI",
-        "camera": "LANTAI1",
-        "color": (255, 180, 0),
-        "line": None,
-        "reverse": False,
-        "label_neg": "OUT",
-        "label_pos": "IN",
-    },
-    3: {
-        "name": "OFFICE LANTAI 1",
-        "camera": "LANTAI1",
-        "color": (200, 80, 255),
-        "line": None,
-        "reverse": False,
-        "label_neg": "OUT",
-        "label_pos": "IN",
-    },
-    4: {
-        "name": "TANGGA",
-        "camera": "LANTAI2.1",
-        "color": (80, 220, 80),
-        "line": None,
-        "reverse": False,
-        "label_neg": "OUT",
-        "label_pos": "IN",
-    },
-    5: {
-        "name": "OFFICE LANTAI 2",
-        "camera": "LANTAI2.2",
-        "color": (0, 140, 255),
-        "line": None,
-        "reverse": False,
-        "label_neg": "OUT",
-        "label_pos": "IN",
-    },
-    6: {
-        "name": "RUANG MEETING 2",
-        "camera": "LANTAI2.1",
-        "color": (180, 105, 255),
-        "line": None,
-        "reverse": False,
-        "label_neg": "OUT",
-        "label_pos": "IN",
-    },
-    7: {
-        "name": "RUANG MEETING 1",
-        "camera": "LANTAI2.2",
-        "color": (255, 0, 0),
-        "line": None,
-        "reverse": False,
-        "label_neg": "OUT",
-        "label_pos": "IN",
-    },
-}
-
-COUNTS = {door_id: {"IN": 0, "OUT": 0} for door_id in DOORS}
-
-# State per pintu. Satu pintu hanya menerima track dari satu kamera,
-# jadi ID tracker antar kamera tidak pernah bertabrakan di sini.
-TRACK_SIDES = {door_id: {} for door_id in DOORS}
-LAST_FOOT_POINT = {door_id: {} for door_id in DOORS}
-LAST_COUNT_TIME = {door_id: {} for door_id in DOORS}
-
-# State per kamera (ID tracker hanya unik di dalam satu kamera).
-TRACKED_PEOPLE = {camera_id: {} for camera_id in CAMERAS}
-TRACK_STATS = {
-    camera_id: {"new": 0, "lost": 0, "crossing": 0} for camera_id in CAMERAS
-}
-LAST_TRACK_SUMMARY = {camera_id: 0.0 for camera_id in CAMERAS}
-
-AREA_NAMES = (
-    "LOBBY",
-    "OFFICE LANTAI 1",
-    "AREA PRODUKSI",
-    "LANTAI 2",
-    "OFFICE LANTAI 2",
-    "RUANG MEETING 1",
-    "RUANG MEETING 2",
-    "LUAR",
-    "BELUM DIKETAHUI",
-)
-
-
-def normalize_area_name(area):
-    mapping = {
-        "Lobby": "LOBBY",
-        "Office Lantai 1": "OFFICE LANTAI 1",
-        "Office Lantai 2": "OFFICE LANTAI 2",
-        "Ruang Meeting 1": "RUANG MEETING 1",
-        "Ruang Meeting 2": "RUANG MEETING 2",
-        "Area Produksi": "AREA PRODUKSI",
-        "Lantai 2": "LANTAI 2",
-        "Luar": "LUAR",
-    }
-    return mapping.get(area, "BELUM DIKETAHUI")
-
-
-def doors_of_camera(camera_id):
-    return [
-        door_id for door_id, door in DOORS.items()
-        if door["camera"] == camera_id
-    ]
-
-
-# Jumlah orang yang sedang berada di setiap area (dipakai bersama
-# oleh kedua kamera).
-AREA_OCCUPANCY = {
-    "Lobby": 0,
-    "Office Lantai 1": 0,
-    "Area Produksi": 0,
-    "Lantai 2": 0,
-    "Office Lantai 2": 0,
-    "Ruang Meeting 1": 0,
-    "Ruang Meeting 2": 0,
-}
-
-# Baris panel: (label tampil, kunci AREA_OCCUPANCY, nomor pintu)
-PANEL_AREAS = [
-    ("Lobby", "Lobby", 1),
-    ("Produksi", "Area Produksi", 2),
-    ("Office L1", "Office Lantai 1", 3),
-    ("Lantai 2", "Lantai 2", 4),
-    ("Office L2", "Office Lantai 2", 5),
-    ("Meeting 2", "Ruang Meeting 2", 6),
-    ("Meeting 1", "Ruang Meeting 1", 7),
-]
-
-ACTIVE_DOOR = 1
-SELECTING_LINE = False
-PENDING_POINTS = []
-
-# Mode ketik angka langsung di jendela video (tombol K).
-INPUT_MODE = False
-INPUT_BUFFER = ""
+MIN_MARGIN = 0.05
 
 STOP_EVENT = threading.Event()
 
-# Mencegah dua thread menulis file state bersamaan.
-STATE_IO_LOCK = threading.Lock()
 
-# Melindungi COUNTS, AREA_OCCUPANCY, TRACK_SIDES, LAST_FOOT_POINT,
-# LAST_COUNT_TIME, dan garis pintu dari akses banyak thread sekaligus
-# (dua thread inferensi + thread UI). RLock = boleh dipanggil bersarang.
-# Aturan: jangan lakukan I/O disk saat memegang lock ini.
-STATE_LOCK = threading.RLock()
+# ============================================================
+# 2. DATABASE WAJAH
+# ============================================================
 
-# Semua penulisan CSV dan file state dilakukan satu thread khusus
-# (log_writer_worker), supaya thread YOLO tidak pernah menunggu disk.
-LOG_QUEUE = queue.Queue()
-LOG_STOP = threading.Event()
-SAVE_REQUEST = threading.Event()
+class FaceDatabase:
+    """
+    Memuat .npz berisi embedding + nama.
+    Mencoba beberapa nama key umum. Kalau key di file kamu beda,
+    ubah bagian KEY_CANDIDATES di bawah (cek output "[DB] Keys").
+    """
 
+    EMB_KEYS = ("embeddings", "embedding", "features", "encodings", "X")
+    NAME_KEYS = ("names", "labels", "name", "identities", "y")
+
+    def __init__(self, path):
+        data = np.load(str(path), allow_pickle=True)
+        print(f"[DB] Keys di {Path(path).name}: {list(data.keys())}")
+
+        emb_key = next((k for k in self.EMB_KEYS if k in data), None)
+        name_key = next((k for k in self.NAME_KEYS if k in data), None)
+
+        if emb_key is None or name_key is None:
+            raise KeyError(
+                f"Key embedding/nama tidak dikenali. Keys: {list(data.keys())}. "
+                "Sesuaikan EMB_KEYS / NAME_KEYS."
+            )
+
+        emb = np.asarray(data[emb_key], dtype=np.float32)
+        names = [str(n) for n in data[name_key]]
+
+        if emb.ndim == 1:
+            emb = emb[None, :]
+        if len(names) != len(emb):
+            raise ValueError(
+                f"Jumlah nama ({len(names)}) != jumlah embedding ({len(emb)})"
+            )
+
+        norms = np.linalg.norm(emb, axis=1, keepdims=True)
+        self.embeddings = emb / np.maximum(norms, 1e-9)
+        self.names = names
+        
+        self.people = sorted(set(names))
+        index = {p: i for i, p in enumerate(self.people)}
+        self.owner = np.array([index[n] for n in names])
+
+        print(f"[DB] {len(set(names))} orang, {len(names)} embedding")
+
+    def match(self, embedding):
+        """Kembalikan (nama, similarity, margin) per ORANG, bukan per embedding."""
+
+        emb = embedding / max(float(np.linalg.norm(embedding)), 1e-9)
+        sims = self.embeddings @ emb
+
+        per_person = np.full(len(self.people), -1.0, dtype=np.float32)
+        np.maximum.at(per_person, self.owner, sims)
+
+        order = np.argsort(per_person)[::-1]
+        best = per_person[order[0]]
+        second = per_person[order[1]] if len(order) > 1 else -1.0
+
+        return self.people[order[0]], float(best), float(best - second)
+
+
+# ============================================================
+# 3. LOG CSV
+# ============================================================
+
+LOG_LOCK = threading.Lock()
+
+
+def write_face_log(track_id, name):
+    FACE_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+    with LOG_LOCK:
+        new_file = not FACE_LOG_FILE.exists()
+
+        with open(FACE_LOG_FILE, "a", newline="", encoding="utf-8-sig") as f:
+            writer = csv.writer(f)
+
+            if new_file:
+                writer.writerow(["timestamp", "camera", "track_id", "employee_name"])
+
+            writer.writerow(
+                [datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                 CAMERA_LABEL, track_id, name]
+            )
+
+
+# ============================================================
+# 4. TRACKER WAJAH SEDERHANA
+# ============================================================
+
+def iou(a, b):
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+
+    union = (ax2 - ax1) * (ay2 - ay1) + (bx2 - bx1) * (by2 - by1) - inter
+    return inter / union if union > 0 else 0.0
+
+
+class FaceTrack:
+    def __init__(self, track_id, box, stamp):
+        self.id = track_id
+        self.box = box
+        self.last_seen = stamp
+        self.name = None
+        self.similarity = 0.0
+        self.votes = deque(maxlen=VOTE_WINDOW)
+        self.mismatch = 0
+        self.last_verified = 0.0
+        self.best = ""
+        self.sim_last = 0.0
+
+
+class FaceTracker:
+    """Cocokkan kotak wajah antar frame (IoU, lalu jarak titik tengah)."""
+
+    def __init__(self):
+        self.tracks = {}
+        self.next_id = 1
+
+    def update(self, boxes, stamp):
+        """boxes: list kotak. Kembalikan list FaceTrack sejajar dengan boxes."""
+
+        assigned = [None] * len(boxes)
+        free = set(self.tracks)
+
+        pairs = []
+        for i, box in enumerate(boxes):
+            w = max(1, box[2] - box[0])
+            cx, cy = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
+
+            for tid in free:
+                t = self.tracks[tid]
+                score = iou(box, t.box)
+
+                if score < TRACK_IOU_MIN:
+                    tcx = (t.box[0] + t.box[2]) / 2
+                    tcy = (t.box[1] + t.box[3]) / 2
+                    dist = ((cx - tcx) ** 2 + (cy - tcy) ** 2) ** 0.5 / w
+
+                    if dist > TRACK_MAX_CENTER_DIST:
+                        continue
+
+                    score = TRACK_IOU_MIN - dist * 0.01
+
+                pairs.append((score, i, tid))
+
+        for score, i, tid in sorted(pairs, reverse=True):
+            if assigned[i] is not None or tid not in free:
+                continue
+
+            track = self.tracks[tid]
+            track.box = boxes[i]
+            track.last_seen = stamp
+            assigned[i] = track
+            free.discard(tid)
+
+        for i, box in enumerate(boxes):
+            if assigned[i] is None:
+                track = FaceTrack(self.next_id, box, stamp)
+                self.tracks[self.next_id] = track
+                self.next_id += 1
+                assigned[i] = track
+
+        for tid in [t for t, tr in self.tracks.items()
+                    if stamp - tr.last_seen > TRACK_LOST_SECONDS]:
+            del self.tracks[tid]
+
+        return assigned
+
+
+# ============================================================
+# 5. STATE KAMERA
+# ============================================================
 
 class CameraState:
-    """Frame, hasil deteksi, dan status satu kamera."""
-
-    def __init__(self, camera_id, url):
-        self.id = camera_id
+    def __init__(self, url):
         self.url = url
         self.lock = threading.Lock()
-
-        # Frame terbaru dari thread capture (belum diproses AI).
         self.frame = None
         self.frame_id = 0
-
-        # Hasil AI terakhir: (frame_id, frame, detections). Kotak digambar
-        # di frame yang sama dengan yang dilihat YOLO, jadi tidak meleset.
-        self.result = None
-
-        # new_frame: capture -> inference ("ada frame baru").
-        # want_frame: inference -> capture ("saya menganggur, kirim frame").
         self.new_frame = threading.Event()
         self.want_frame = threading.Event()
         self.want_frame.set()
 
+        # hasil: (frame_id, frame, [dict wajah])
+        self.result = None
         self.camera_ok = False
         self.last_error = ""
         self.fps = 0.0
+        self.faces_in_frame = 0
+        
+        self.t_det = 0.0
+        self.t_emb = 0.0
 
-    def get_view_data(self):
-        """(frame_id, frame, detections) untuk digambar di layar."""
-
+    def get_view(self):
         with self.lock:
             if self.result is not None:
                 return self.result
-
             return (self.frame_id, self.frame, [])
 
 
-# ============================================================
-# 3. LOG CSV (ditulis oleh thread khusus)
-# ============================================================
-
-OCCUPANCY_HEADER = [
-    "timestamp",
-    "camera",
-    "door",
-    "direction",
-    "track_id",
-    "event",
-    "lobby_count",
-    "office_l1_count",
-    "produksi_count",
-    "lantai2_count",
-    "office_l2_count",
-    "meeting2_count",
-    "meeting1_count",
-]
-
-TRACK_HEADER = [
-    "timestamp", "camera", "event", "track_id", "area", "confidence",
-    "x1", "y1", "x2", "y2", "foot_x", "foot_y",
-    "duration_seconds", "door", "direction", "transition",
-]
-
-FACE_HEADER = [
-    "timestamp",
-    "camera",
-    "track_id",
-    "employee_name",
-]
-
-CSV_TARGETS = {
-    "occupancy": (LOG_FILE, OCCUPANCY_HEADER),
-    "track": (TRACK_LOG_FILE, TRACK_HEADER),
-    "face": (FACE_LOG_FILE, FACE_HEADER),
-}
-
-MAX_PENDING_ROWS = 20000
-
-
-def now_string():
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-
-def write_log(camera_label, door_name, direction, track_id, occupancy):
-    """occupancy = snapshot AREA_OCCUPANCY saat event terjadi."""
-
-    LOG_QUEUE.put(
-        (
-            "occupancy",
-            [
-                now_string(),
-                camera_label,
-                door_name,
-                direction,
-                track_id,
-                "AREA_TRANSITION",
-                occupancy["Lobby"],
-                occupancy["Office Lantai 1"],
-                occupancy["Area Produksi"],
-                occupancy["Lantai 2"],
-                occupancy["Office Lantai 2"],
-                occupancy["Ruang Meeting 2"],
-                occupancy["Ruang Meeting 1"],
-            ],
-        )
-    )
-
-
-def write_track_log(camera_label, event, track_id, data=None, door="", direction="", transition="", duration=""):
-    data = data or {}
-    box = data.get("box") or ("", "", "", "")
-    point = data.get("point") or ("", "")
-
-    LOG_QUEUE.put(
-        (
-            "track",
-            [
-                now_string(), camera_label, event, track_id,
-                data.get("area", "BELUM DIKETAHUI"), data.get("confidence", ""),
-                *box, *point, duration, door, direction, transition,
-            ],
-        )
-    )
-
-
-def write_face_log(camera_label, track_id, employee_name):
-    LOG_QUEUE.put(
-        (
-            "face",
-            [
-                now_string(),
-                camera_label,
-                track_id,
-                employee_name,
-            ],
-        )
-    )
-
-
-def request_save():
-    """Minta thread penulis menyimpan state (permintaan beruntun digabung)."""
-
-    SAVE_REQUEST.set()
-
-
-def append_rows(path, header, rows):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    new_file = not path.exists()
-
-    with open(path, "a", newline="", encoding="utf-8-sig") as file:
-        writer = csv.writer(file)
-
-        if new_file:
-            writer.writerow(header)
-
-        writer.writerows(rows)
-
-
-def log_writer_worker():
-    """
-    Satu-satunya thread yang menulis CSV dan file state.
-    Kalau file gagal ditulis (misalnya sedang dibuka di Excel), baris
-    ditahan dan dicoba lagi, bukan hilang.
-    """
-
-    pending = {
-        "occupancy": [],
-        "track": [],
-        "face": [],
-    }
-    last_warning = 0.0
-
-    while True:
-        try:
-            kind, row = LOG_QUEUE.get(timeout=0.5)
-            pending[kind].append(row)
-
-            while True:
-                try:
-                    kind, row = LOG_QUEUE.get_nowait()
-                    pending[kind].append(row)
-                except queue.Empty:
-                    break
-
-        except queue.Empty:
-            pass
-
-        for kind, rows in pending.items():
-            if not rows:
-                continue
-
-            path, header = CSV_TARGETS[kind]
-
-            try:
-                append_rows(path, header, rows)
-                rows.clear()
-
-            except Exception as error:
-                if len(rows) > MAX_PENDING_ROWS:
-                    del rows[: len(rows) - MAX_PENDING_ROWS]
-
-                if time.monotonic() - last_warning > 10.0:
-                    last_warning = time.monotonic()
-                    print(
-                        f"[WARNING] Gagal menulis {path} ({error}). "
-                        f"{len(rows)} baris ditahan, dicoba lagi."
-                    )
-
-        if SAVE_REQUEST.is_set():
-            SAVE_REQUEST.clear()
-            save_state()
-
-        if LOG_STOP.is_set() and LOG_QUEUE.empty():
-            break
-
-
-def print_track_summary(cam, stamp):
-    camera_id = cam.id
-
-    if stamp - LAST_TRACK_SUMMARY[camera_id] < TRACK_SUMMARY_INTERVAL:
-        return
-
-    LAST_TRACK_SUMMARY[camera_id] = stamp
-
-    stats = TRACK_STATS[camera_id]
-    area_counts = {name: 0 for name in AREA_NAMES}
-    active_total = 0
-
-    for data in list(TRACKED_PEOPLE[camera_id].values()):
-        if stamp - data.get("last_seen", 0) <= TRACK_ACTIVE_WINDOW:
-            active_total += 1
-            area = data.get("area", "BELUM DIKETAHUI")
-            area_counts[area if area in area_counts else "BELUM DIKETAHUI"] += 1
-
-    print(
-        f"\n[TRACK SUMMARY {CAMERAS[camera_id]['label']}] "
-        f"{datetime.now().strftime('%H:%M:%S')} | "
-        f"ACTIVE={active_total} | NEW={stats['new']} | "
-        f"LOST={stats['lost']} | CROSSING={stats['crossing']} | FPS={cam.fps:.1f}"
-    )
-    for area in AREA_NAMES:
-        print(f"  {area:<16}: {area_counts[area]} active")
-    print("")
-
-
-# ============================================================
-# 4. SIMPAN DAN MUAT KONFIGURASI GARIS
-# ============================================================
-
-def save_config():
-    data = {"doors": {}}
-
-    for door_id, door in DOORS.items():
-
-        # Lewati pintu yang kameranya sedang tidak aktif
-        if door["camera"] not in FRAME_SIZES:
-            continue
-
-        line = door["line"]
-        normalized_line = None
-
-        frame_width, frame_height = FRAME_SIZES[door["camera"]]
-
-        if line is not None:
-            normalized_line = [
-                [x / frame_width, y / frame_height]
-                for x, y in line
-            ]
-
-        data["doors"][str(door_id)] = {
-            "camera": door["camera"],
-            "line": normalized_line,
-            "reverse": door["reverse"],
-        }
-
-    CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
-
-    with open(CONFIG_FILE, "w", encoding="utf-8") as file:
-        json.dump(data, file, indent=4)
-
-    print("[CONFIG] Konfigurasi garis tersimpan.")
-
-
-def load_config():
-    if not CONFIG_FILE.exists():
-        print("[CONFIG] Belum ada konfigurasi garis.")
-        return
-
-    try:
-        with open(CONFIG_FILE, "r", encoding="utf-8") as file:
-            data = json.load(file)
-
-        for key, config in data.get("doors", {}).items():
-            door_id = int(key)
-
-            if door_id not in DOORS:
-                continue
-
-            door = DOORS[door_id]
-
-            if door["camera"] not in FRAME_SIZES:
-                continue
-
-            # Konfigurasi lama (satu kamera) tidak punya field "camera"
-            # dan semua garisnya milik kamera lobby.
-            saved_camera = config.get("camera", "LANTAI1")
-            saved_camera = CAMERA_ALIASES.get(saved_camera, saved_camera)
-
-            if saved_camera != door["camera"]:
-                print(
-                    f"[CONFIG] Garis {door['name']} lama berasal dari kamera "
-                    f"{saved_camera}, diabaikan. Pasang ulang di kamera "
-                    f"{CAMERAS[door['camera']]['title']} (tekan {door_id})."
-                )
-                continue
-
-            frame_width, frame_height = FRAME_SIZES[door["camera"]]
-            normalized_line = config.get("line")
-
-            if normalized_line:
-                door["line"] = [
-                    (
-                        int(point[0] * frame_width),
-                        int(point[1] * frame_height),
-                    )
-                    for point in normalized_line
-                ]
-
-            door["reverse"] = config.get("reverse", False)
-
-        print("[CONFIG] Konfigurasi berhasil dimuat.")
-
-    except Exception as error:
-        print("[ERROR] Gagal memuat konfigurasi:", error)
-
-
-# ============================================================
-# 4b. SIMPAN, MUAT, DAN RESET STATE OKUPANSI
-# ============================================================
-
-
-def save_state():
-    """Simpan okupansi dan hitungan IN/OUT supaya selamat dari restart."""
-
-    # Snapshot cepat di bawah lock; tulis file di luar lock.
-    with STATE_LOCK:
-        data = {
-            "date": datetime.now().strftime("%Y-%m-%d"),
-            "occupancy": dict(AREA_OCCUPANCY),
-            "counts": {
-                str(door_id): dict(value)
-                for door_id, value in COUNTS.items()
-            },
-        }
-
-    with STATE_IO_LOCK:
-        STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        tmp_file = STATE_FILE.with_suffix(".tmp")
-
-        try:
-            with open(tmp_file, "w", encoding="utf-8") as file:
-                json.dump(data, file, indent=2)
-
-            # Atomik: file lama tidak rusak kalau mati listrik.
-            tmp_file.replace(STATE_FILE)
-
-        except Exception as error:
-            print("[ERROR] Gagal menyimpan state:", error)
-
-
-def load_state():
-    """Pulihkan state hanya kalau tanggalnya hari ini."""
-
-    if not STATE_FILE.exists():
-        print("[STATE] Belum ada state tersimpan.")
-        return
-
-    try:
-        with open(STATE_FILE, "r", encoding="utf-8") as file:
-            data = json.load(file)
-
-        today = datetime.now().strftime("%Y-%m-%d")
-
-        if data.get("date") != today:
-            print("[STATE] State hari lain diabaikan, mulai dari 0.")
-            return
-
-        saved_occupancy = data.get("occupancy", {})
-
-        # State lama memakai nama "Ruang IT" untuk area yang sama.
-        if "Office Lantai 1" not in saved_occupancy and "Ruang IT" in saved_occupancy:
-            saved_occupancy["Office Lantai 1"] = saved_occupancy["Ruang IT"]
-
-        with STATE_LOCK:
-            for key in AREA_OCCUPANCY:
-                AREA_OCCUPANCY[key] = max(0, int(saved_occupancy.get(key, 0)))
-
-            for key, value in data.get("counts", {}).items():
-                door_id = int(key)
-
-                if door_id in COUNTS:
-                    COUNTS[door_id]["IN"] = int(value.get("IN", 0))
-                    COUNTS[door_id]["OUT"] = int(value.get("OUT", 0))
-
-        print(f"[STATE] Dipulihkan: {AREA_OCCUPANCY}")
-
-    except Exception as error:
-        print("[ERROR] Gagal memuat state:", error)
-
-
-def reset_counts(reason):
-    """Reset semua hitungan crossing dan okupansi area."""
-
-    with STATE_LOCK:
-        for door_id in DOORS:
-            COUNTS[door_id]["IN"] = 0
-            COUNTS[door_id]["OUT"] = 0
-
-            TRACK_SIDES[door_id].clear()
-            LAST_FOOT_POINT[door_id].clear()
-            LAST_COUNT_TIME[door_id].clear()
-
-        for area_name in AREA_OCCUPANCY:
-            AREA_OCCUPANCY[area_name] = 0
-
-    request_save()
-
-    print(f"[INFO] Hitungan dan okupansi direset ({reason}).")
-
-
-def adjust_area(area_key, delta):
-    """Koreksi manual okupansi satu area."""
-
-    with STATE_LOCK:
-        AREA_OCCUPANCY[area_key] = max(0, AREA_OCCUPANCY[area_key] + delta)
-        new_value = AREA_OCCUPANCY[area_key]
-
-    request_save()
-
-    print(f"[KOREKSI] {area_key} {delta:+d} -> {new_value}")
-
-
-def set_area(area_key, value):
-    """Isi okupansi satu area secara manual."""
-
-    with STATE_LOCK:
-        AREA_OCCUPANCY[area_key] = max(0, int(value))
-        new_value = AREA_OCCUPANCY[area_key]
-
-    request_save()
-
-    print(f"[KOREKSI] {area_key} diatur ke {new_value}")
-
-
-def get_snapshot():
-    """Salinan okupansi dan hitungan untuk digambar di panel."""
-
-    with STATE_LOCK:
-        occupancy = dict(AREA_OCCUPANCY)
-        counts = {
-            door_id: dict(value)
-            for door_id, value in COUNTS.items()
-        }
-
-    return occupancy, counts
-
-
-def make_state_key(snapshot):
-    """
-    Kunci murah yang berubah kalau okupansi, hitungan, atau garis pintu
-    berubah. Dipakai untuk memutuskan perlu menggambar ulang panel atau tidak.
-    """
-
-    occupancy, counts = snapshot
-
-    lines = tuple(
-        (
-            tuple(door["line"]) if door["line"] else None,
-            door["reverse"],
-        )
-        for door in DOORS.values()
-    )
+def load_camera_url():
+    with open(CAMERA_CONFIG_FILE, "r", encoding="utf-8") as f:
+        config = json.load(f)
+
+    cam = config.get(CAMERA_GROUP, config)[CAMERA_ID]
+    user = quote(str(cam["username"]), safe="")
+    pwd = quote(str(cam["password"]), safe="")
 
     return (
-        tuple(sorted(occupancy.items())),
-        tuple(
-            (door_id, value["IN"], value["OUT"])
-            for door_id, value in sorted(counts.items())
-        ),
-        lines,
+        f"rtsp://{user}:{pwd}@{cam['ip']}:{int(cam.get('port', 554))}"
+        f"/Streaming/Channels/{cam.get('channel', '101')}"
     )
-
-
-# ============================================================
-# 5. GEOMETRI GARIS
-# ============================================================
-
-
-def calculate_side(point, line_start, line_end):
-    """Jarak bertanda (piksel) titik terhadap garis."""
-
-    x, y = point
-    x1, y1 = line_start
-    x2, y2 = line_end
-
-    length = math.hypot(x2 - x1, y2 - y1)
-
-    if length < 1:
-        return 0.0
-
-    return ((x2 - x1) * (y - y1) - (y2 - y1) * (x - x1)) / length
-
-
-def calculate_crossing_point(
-    previous_point,
-    current_point,
-    line_start,
-    line_end,
-):
-    """Hitung titik perpotongan lintasan dengan garis virtual."""
-
-    previous_value = calculate_side(previous_point, line_start, line_end)
-    current_value = calculate_side(current_point, line_start, line_end)
-
-    denominator = previous_value - current_value
-
-    if abs(denominator) < 1e-6:
-        return None
-
-    ratio = previous_value / denominator
-
-    x = previous_point[0] + ratio * (current_point[0] - previous_point[0])
-    y = previous_point[1] + ratio * (current_point[1] - previous_point[1])
-
-    return x, y
-
-
-def point_on_segment(point, line_start, line_end):
-    """Pastikan titik crossing berada pada segmen garis pintu."""
-
-    px, py = point
-    x1, y1 = line_start
-    x2, y2 = line_end
-
-    dx = x2 - x1
-    dy = y2 - y1
-
-    length_squared = dx * dx + dy * dy
-
-    if length_squared == 0:
-        return False
-
-    ratio = ((px - x1) * dx + (py - y1) * dy) / length_squared
-
-    if ratio < 0 or ratio > 1:
-        return False
-
-    projected_x = x1 + ratio * dx
-    projected_y = y1 + ratio * dy
-
-    distance = math.hypot(px - projected_x, py - projected_y)
-
-    return distance <= 30
-
-
-# ============================================================
-# 6. UPDATE OKUPANSI AREA
-# ============================================================
-
-
-def decrement(area_key):
-    """Kurangi okupansi area; beri peringatan kalau sudah 0."""
-
-    if AREA_OCCUPANCY[area_key] <= 0:
-        print(
-            f"[WARNING] {area_key} sudah 0 tapi ada orang keluar "
-            "(hitungan meleset / ID switch / orang sudah ada sebelum start)."
-        )
-        return
-
-    AREA_OCCUPANCY[area_key] -= 1
-
-
-def update_area_occupancy(door_id, direction):
-    """
-    Kamera LANTAI1:
-    Pintu 1:  IN = luar gedung -> Lobby      | OUT = Lobby -> luar gedung
-    Pintu 2:  IN = Lobby -> Area Produksi    | OUT = Area Produksi -> Lobby
-    Pintu 3:  IN = Lobby -> Office Lantai 1  | OUT = Office Lantai 1 -> Lobby
-
-    Kamera LANTAI2:
-    Pintu 4 (tangga):  IN = naik, Lobby -> Lantai 2
-                       OUT = turun, Lantai 2 -> Lobby
-    Pintu 5 (office):  IN = Lantai 2 -> Office Lantai 2
-                       OUT = Office Lantai 2 -> Lantai 2
-    Pintu 6 (meeting 2): IN = Lantai 2 -> Ruang Meeting 2
-                         OUT = Ruang Meeting 2 -> Lantai 2
-    Pintu 7 (meeting 1): IN = Lantai 2 -> Ruang Meeting 1
-                         OUT = Ruang Meeting 1 -> Lantai 2
-    """
-
-    transition = None
-
-    if door_id == 1:
-        if direction == "IN":
-            AREA_OCCUPANCY["Lobby"] += 1
-            transition = "Luar -> Lobby"
-        else:
-            decrement("Lobby")
-            transition = "Lobby -> Luar"
-
-    elif door_id == 2:
-        if direction == "IN":
-            decrement("Lobby")
-            AREA_OCCUPANCY["Area Produksi"] += 1
-            transition = "Lobby -> Area Produksi"
-        else:
-            decrement("Area Produksi")
-            AREA_OCCUPANCY["Lobby"] += 1
-            transition = "Area Produksi -> Lobby"
-
-    elif door_id == 3:
-        if direction == "IN":
-            decrement("Lobby")
-            AREA_OCCUPANCY["Office Lantai 1"] += 1
-            transition = "Lobby -> Office Lantai 1"
-        else:
-            decrement("Office Lantai 1")
-            AREA_OCCUPANCY["Lobby"] += 1
-            transition = "Office Lantai 1 -> Lobby"
-
-    elif door_id == 4:
-        if direction == "IN":
-            decrement("Lobby")
-            AREA_OCCUPANCY["Lantai 2"] += 1
-            transition = "Lobby -> Lantai 2"
-        else:
-            decrement("Lantai 2")
-            AREA_OCCUPANCY["Lobby"] += 1
-            transition = "Lantai 2 -> Lobby"
-
-    elif door_id == 5:
-        if direction == "IN":
-            decrement("Lantai 2")
-            AREA_OCCUPANCY["Office Lantai 2"] += 1
-            transition = "Lantai 2 -> Office Lantai 2"
-        else:
-            decrement("Office Lantai 2")
-            AREA_OCCUPANCY["Lantai 2"] += 1
-            transition = "Office Lantai 2 -> Lantai 2"
-
-    elif door_id == 6:
-        if direction == "IN":
-            decrement("Lantai 2")
-            AREA_OCCUPANCY["Ruang Meeting 2"] += 1
-            transition = "Lantai 2 -> Ruang Meeting 2"
-        else:
-            decrement("Ruang Meeting 2")
-            AREA_OCCUPANCY["Lantai 2"] += 1
-            transition = "Ruang Meeting 2 -> Lantai 2"
-
-    elif door_id == 7:
-        if direction == "IN":
-            decrement("Lantai 2")
-            AREA_OCCUPANCY["Ruang Meeting 1"] += 1
-            transition = "Lantai 2 -> Ruang Meeting 1"
-        else:
-            decrement("Ruang Meeting 1")
-            AREA_OCCUPANCY["Lantai 2"] += 1
-            transition = "Ruang Meeting 1 -> Lantai 2"
-
-    return transition
-
-
-# ============================================================
-# 7. PROSES CROSSING ORANG
-# ============================================================
-
-
-def _process_crossing(door_id, track_id, foot_point):
-    """
-    Logika crossing. Harus dipanggil di bawah STATE_LOCK.
-    Mengembalikan data event kalau ada hitungan baru, selain itu None.
-    """
-
-    door = DOORS[door_id]
-    line = door["line"]
-
-    if line is None:
-        return
-
-    line_start, line_end = line
-
-    # Margin dalam piksel, mengikuti resolusi frame kamera pintu ini.
-    frame_width = FRAME_SIZES[door["camera"]][0]
-    margin = CROSSING_MARGIN_RATIO * frame_width
-
-    previous_point = LAST_FOOT_POINT[door_id].get(track_id)
-
-    if previous_point is None:
-        LAST_FOOT_POINT[door_id][track_id] = foot_point
-
-        side_value = calculate_side(foot_point, line_start, line_end)
-
-        if abs(side_value) >= margin:
-            TRACK_SIDES[door_id][track_id] = 1 if side_value > 0 else -1
-
-        return
-
-    previous_side = TRACK_SIDES[door_id].get(track_id)
-
-    current_value = calculate_side(foot_point, line_start, line_end)
-
-    LAST_FOOT_POINT[door_id][track_id] = foot_point
-
-    if abs(current_value) < margin:
-        return
-
-    current_side = 1 if current_value > 0 else -1
-
-    if previous_side is None:
-        TRACK_SIDES[door_id][track_id] = current_side
-        return
-
-    if previous_side == current_side:
-        return
-
-    crossing_point = calculate_crossing_point(
-        previous_point,
-        foot_point,
-        line_start,
-        line_end,
-    )
-
-    TRACK_SIDES[door_id][track_id] = current_side
-
-    if crossing_point is None:
-        return
-
-    if not point_on_segment(crossing_point, line_start, line_end):
-        return
-
-    now = time.monotonic()
-    last_time = LAST_COUNT_TIME[door_id].get(track_id, 0)
-
-    if now - last_time < COUNT_COOLDOWN:
-        return
-
-    # Arah default:
-    # sisi negatif -> positif = IN
-    # sisi positif -> negatif = OUT
-    if not door["reverse"]:
-        direction = "IN" if previous_side == -1 else "OUT"
-    else:
-        direction = "OUT" if previous_side == -1 else "IN"
-
-    COUNTS[door_id][direction] += 1
-
-    transition = update_area_occupancy(door_id, direction)
-
-    LAST_COUNT_TIME[door_id][track_id] = now
-
-    return door["name"], direction, track_id, dict(AREA_OCCUPANCY), transition
-
-
-def process_crossing(door_id, track_id, foot_point):
-    """Hitung crossing di bawah lock, lalu catat log/state di luar lock."""
-
-    with STATE_LOCK:
-        event = _process_crossing(door_id, track_id, foot_point)
-
-    if event is None:
-        return
-
-    door_name, direction, event_track_id, occupancy, transition = event
-
-    camera_id = DOORS[door_id]["camera"]
-    camera_label = CAMERAS[camera_id]["label"]
-
-    destination = transition.split(" -> ")[-1] if transition else "BELUM DIKETAHUI"
-
-    people = TRACKED_PEOPLE[camera_id]
-    track_data = people.get(event_track_id, {})
-    track_data["area"] = normalize_area_name(destination)
-    people[event_track_id] = track_data
-
-    TRACK_STATS[camera_id]["crossing"] += 1
-
-    print(
-        f"[CROSSING] {datetime.now().strftime('%H:%M:%S')} | "
-        f"{camera_label} | "
-        f"ID={event_track_id} | {normalize_area_name(transition.split(' -> ')[0]) if transition else 'AREA?'} "
-        f"-> {normalize_area_name(destination)} | {direction} | PINTU={door_name}"
-    )
-    write_track_log(camera_label, "CROSSING", event_track_id, track_data, door_name, direction, transition)
-    write_log(camera_label, door_name, direction, event_track_id, occupancy)
-
-    # Event crossing jarang terjadi, jadi aman disimpan tiap kali
-    # (ditulis thread khusus, bukan thread YOLO).
-    request_save()
-
-
-# ============================================================
-# 8. GAMBAR DETEKSI, GARIS, DAN PANEL
-# ============================================================
-
-
-def put_text_right(frame, text, x_right, y, scale, color, thickness=1):
-    """Teks rata kanan, supaya angka sejajar."""
-
-    (tw, _), _ = cv2.getTextSize(
-        text, cv2.FONT_HERSHEY_SIMPLEX, scale, thickness
-    )
-
-    cv2.putText(
-        frame,
-        text,
-        (x_right - tw, y),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        scale,
-        color,
-        thickness,
-        cv2.LINE_AA,
-    )
-
-
-def draw_detections(frame, detections):
-    """Tempel kotak dan ID hasil deteksi ke frame."""
-
-    for det in detections:
-        x1, y1, x2, y2 = det["box"]
-
-        # Warna kotak:
-        # Kuning = wajah berhasil dikenali
-        # Hijau = orang belum dikenali
-        color = (0, 255, 255) if det.get("name") else (0, 255, 0)
-
-        cv2.rectangle(
-            frame,
-            (x1, y1),
-            (x2, y2),
-            color,
-            1
-        )
-
-        cv2.putText(
-            frame,
-            (
-                f"ID {det['id']} | {det['name']}"
-                if det.get("name")
-                else f"PERSON ID {det['id']}"
-            ),
-            (x1, max(16, y1 - 5)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.4,
-            color,
-            1,
-            cv2.LINE_AA,
-        )
-
-        # Bounding box wajah
-        face_box = det.get("face_box")
-
-        if face_box:
-            fx1, fy1, fx2, fy2 = face_box
-            face_name = det.get("name") or "DETECTED"
-
-            face_color = (0, 255, 255) if det.get("name") else (0, 255, 0)
-
-            cv2.rectangle(
-                frame,
-                (fx1, fy1),
-                (fx2, fy2),
-                face_color,
-                2,
-            )
-
-            cv2.putText(
-                frame,
-                "FACE DETECTED" if face_name == "DETECTED" else f"FACE: {face_name}",
-                (fx1, max(15, fy1 - 5)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.4,
-                face_color,
-                1,
-                cv2.LINE_AA,
-            )
-
-        cv2.circle(frame, det["foot"], 3, (0, 0, 255), -1)
-
-
-def draw_door_lines(frame, camera_id):
-    """Garis virtual pintu milik kamera ini beserta label arahnya."""
-
-    h, w = frame.shape[:2]
-    font = cv2.FONT_HERSHEY_SIMPLEX
-
-    for door_id in doors_of_camera(camera_id):
-        door = DOORS[door_id]
-        line = door["line"]
-        color = door["color"]
-
-        if line is None:
-            continue
-
-        x1, y1 = line[0]
-        x2, y2 = line[1]
-
-        cv2.line(frame, (x1, y1), (x2, y2), color, 2)
-        cv2.circle(frame, (x1, y1), 4, color, -1)
-        cv2.circle(frame, (x2, y2), 4, color, -1)
-
-        middle_x = (x1 + x2) // 2
-        middle_y = (y1 + y2) // 2
-
-        # Nama pintu
-        cv2.putText(
-            frame,
-            door["name"],
-            (max(5, middle_x - 60), max(20, middle_y - 10)),
-            font,
-            0.38,
-            color,
-            1,
-            cv2.LINE_AA,
-        )
-
-        # Arah tegak lurus garis
-        dx = x2 - x1
-        dy = y2 - y1
-        length = math.hypot(dx, dy)
-
-        if length < 1:
-            continue
-
-        nx = -dy / length
-        ny = dx / length
-        offset = 32
-
-        if door.get("reverse", False):
-            neg_text, pos_text = door["label_pos"], door["label_neg"]
-        else:
-            neg_text, pos_text = door["label_neg"], door["label_pos"]
-
-        labels = [
-            (
-                int(middle_x - nx * offset),
-                int(middle_y - ny * offset),
-                neg_text,
-                (0, 0, 180),
-            ),
-            (
-                int(middle_x + nx * offset),
-                int(middle_y + ny * offset),
-                pos_text,
-                (0, 130, 0),
-            ),
-        ]
-
-        for lx, ly, text, bg_color in labels:
-            font_scale = 0.3
-            thickness = 1
-
-            (tw, th), _ = cv2.getTextSize(text, font, font_scale, thickness)
-
-            lx = max(5, min(lx - tw // 2, w - tw - 10))
-            ly = max(th + 8, min(ly, h - 8))
-
-            cv2.rectangle(
-                frame,
-                (lx - 5, ly - th - 5),
-                (lx + tw + 5, ly + 5),
-                bg_color,
-                -1,
-            )
-
-            cv2.putText(
-                frame,
-                text,
-                (lx, ly),
-                font,
-                font_scale,
-                (255, 255, 255),
-                thickness,
-                cv2.LINE_AA,
-            )
-
-
-def draw_info_panel(frame, fps_text, snapshot):
-    """Panel kecil: jumlah orang per area + IN/OUT pintu terkait."""
-
-    h, w = frame.shape[:2]
-    font = cv2.FONT_HERSHEY_SIMPLEX
-
-    occupancy, counts = snapshot
-
-    row_h = 14
-    panel_w = 150
-    panel_h = 22 + len(PANEL_AREAS) * row_h + 12
-    x = max(0, w - panel_w - 6)
-    y = 6
-
-    # Latar transparan hanya di area panel (tanpa copy seluruh frame).
-    roi = frame[y:y + panel_h, x:x + panel_w]
-    background = np.full_like(roi, (20, 20, 20))
-    cv2.addWeighted(background, 0.75, roi, 0.25, 0, roi)
-
-    col_orang = x + 90
-    col_in = x + 116
-    col_out = x + 144
-    gray = (170, 170, 170)
-
-    # Judul kolom
-    cv2.putText(
-        frame, "AREA", (x + 11, y + 12), font, 0.3, gray, 1, cv2.LINE_AA
-    )
-    put_text_right(frame, "ORANG", col_orang, y + 12, 0.3, gray)
-    put_text_right(frame, "IN", col_in, y + 12, 0.3, (0, 255, 100))
-    put_text_right(frame, "OUT", col_out, y + 12, 0.3, (0, 100, 255))
-
-    cv2.line(
-        frame,
-        (x + 5, y + 17),
-        (x + panel_w - 5, y + 17),
-        (90, 90, 90),
-        1,
-    )
-
-    for i, (label, area_key, door_id) in enumerate(PANEL_AREAS):
-        top = y + 20 + i * row_h
-        base = top + 10
-
-        # Garis warna = warna garis pintu di video.
-        cv2.rectangle(
-            frame,
-            (x + 5, top + 1),
-            (x + 7, top + row_h - 2),
-            DOORS[door_id]["color"],
-            -1,
-        )
-
-        cv2.putText(
-            frame, label, (x + 11, base), font, 0.35,
-            (255, 255, 255), 1, cv2.LINE_AA,
-        )
-
-        put_text_right(
-            frame, str(occupancy[area_key]),
-            col_orang, base, 0.45, (255, 255, 255), 1,
-        )
-
-        put_text_right(
-            frame, str(counts[door_id]["IN"]),
-            col_in, base, 0.35, (0, 255, 100),
-        )
-
-        put_text_right(
-            frame, str(counts[door_id]["OUT"]),
-            col_out, base, 0.35, (0, 100, 255),
-        )
-
-    cv2.putText(
-        frame, f"FPS {fps_text}", (x + 6, y + panel_h - 4),
-        font, 0.28, gray, 1, cv2.LINE_AA,
-    )
-
-
-def draw_input_prompt(frame):
-    """Kotak input angka di tengah jendela (mode tombol K)."""
-
-    h, w = frame.shape[:2]
-    font = cv2.FONT_HERSHEY_SIMPLEX
-
-    box_w = min(420, w - 20)
-    box_h = 90
-    x = (w - box_w) // 2
-    y = (h - box_h) // 2
-
-    roi = frame[y:y + box_h, x:x + box_w]
-    background = np.full_like(roi, (20, 20, 20))
-    cv2.addWeighted(background, 0.85, roi, 0.15, 0, roi)
-
-    cv2.rectangle(frame, (x, y), (x + box_w, y + box_h), (0, 200, 255), 2)
-
-    cv2.putText(
-        frame, "ISI OKUPANSI LOBBY", (x + 12, y + 24),
-        font, 0.55, (0, 200, 255), 1, cv2.LINE_AA,
-    )
-
-    cursor = "_" if int(time.time() * 2) % 2 == 0 else " "
-
-    cv2.putText(
-        frame, f"{INPUT_BUFFER}{cursor}", (x + 12, y + 58),
-        font, 1.0, (255, 255, 255), 2, cv2.LINE_AA,
-    )
-
-    cv2.putText(
-        frame, "ENTER = simpan | ESC = batal", (x + 12, y + 80),
-        font, 0.4, (170, 170, 170), 1, cv2.LINE_AA,
-    )
-
-
-def render_camera(cam, view_data, fps_text, snapshot):
-    """Gambar satu panel kamera (ukuran asli frame kamera)."""
-
-    camera_id = cam.id
-    _, raw_frame, detections = view_data
-
-    if raw_frame is None:
-        frame_width, frame_height = FRAME_SIZES[camera_id]
-        frame = np.zeros((frame_height, frame_width, 3), dtype="uint8")
-
-        cv2.putText(
-            frame,
-            "MENUNGGU CCTV...",
-            (30, 50),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (0, 200, 255),
-            1,
-        )
-
-    else:
-        # Frame bersama tidak boleh digambari, jadi di-copy
-        # (hanya saat panel memang perlu digambar ulang).
-        frame = raw_frame.copy()
-
-        draw_detections(frame, detections)
-        draw_door_lines(frame, camera_id)
-
-        if camera_id == INFO_PANEL_CAMERA:
-            draw_info_panel(frame, fps_text, snapshot)
-
-        if SELECTING_LINE and DOORS[ACTIVE_DOOR]["camera"] == camera_id:
-            message = (
-                f"SET GARIS: "
-                f"{DOORS[ACTIVE_DOOR]['name']} - "
-                f"KLIK {len(PENDING_POINTS) + 1}/2"
-            )
-
-            cv2.putText(
-                frame,
-                message,
-                (8, 36),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.5,
-                DOORS[ACTIVE_DOOR]["color"],
-                1,
-                cv2.LINE_AA,
-            )
-
-            for point in list(PENDING_POINTS):
-                cv2.circle(
-                    frame,
-                    point,
-                    5,
-                    DOORS[ACTIVE_DOOR]["color"],
-                    -1,
-                )
-
-    # Judul kamera
-    cv2.putText(
-        frame,
-        f"{CAMERAS[camera_id]['title']} | FPS {cam.fps:.0f}",
-        (8, 16),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.4,
-        (255, 255, 255),
-        1,
-        cv2.LINE_AA,
-    )
-
-    if not cam.camera_ok:
-        cv2.putText(
-            frame,
-            "CAMERA RECONNECTING",
-            (8, 56),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            (0, 0, 255),
-            1,
-            cv2.LINE_AA,
-        )
-
-    elif cam.last_error:
-        cv2.putText(
-            frame,
-            cam.last_error[:70],
-            (8, 56),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.4,
-            (0, 0, 255),
-            1,
-            cv2.LINE_AA,
-        )
-
-    return frame
-
-
-# ============================================================
-# 9. MOUSE CALLBACK UNTUK MENGATUR GARIS
-# ============================================================
-
-
-def mouse_callback(event, x, y, flags, param):
-    global PENDING_POINTS
-    global SELECTING_LINE
-
-    if event != cv2.EVENT_LBUTTONDOWN:
-        return
-
-    if not SELECTING_LINE:
-        return
-
-    # Garis hanya boleh dipasang di panel kamera milik pintu aktif.
-    camera_id = DOORS[ACTIVE_DOOR]["camera"]
-    view = VIEWS.get(camera_id)
-
-    if view is None:
-        return
-
-    local_x = x - view["x"]
-    local_y = y - view["y"]
-
-    if not (0 <= local_x < view["w"] and 0 <= local_y < view["h"]):
-        print(
-            f"[WARNING] {DOORS[ACTIVE_DOOR]['name']} dipasang di panel "
-            f"{CAMERAS[camera_id]['title']}. Klik di panel itu."
-        )
-        return
-
-    frame_width, frame_height = FRAME_SIZES[camera_id]
-
-    original_x = int(local_x * frame_width / view["w"])
-    original_y = int(local_y * frame_height / view["h"])
-
-    original_x = max(0, min(frame_width - 1, original_x))
-    original_y = max(0, min(frame_height - 1, original_y))
-
-    PENDING_POINTS.append((original_x, original_y))
-
-    print(
-        f"[{DOORS[ACTIVE_DOOR]['name']}] "
-        f"Titik {len(PENDING_POINTS)}/2: "
-        f"{original_x}, {original_y}"
-    )
-
-    if len(PENDING_POINTS) < 2:
-        return
-
-    if PENDING_POINTS[0] == PENDING_POINTS[1]:
-        print("[WARNING] Kedua titik tidak boleh sama.")
-        PENDING_POINTS = []
-        return
-
-    with STATE_LOCK:
-        DOORS[ACTIVE_DOOR]["line"] = [
-            PENDING_POINTS[0],
-            PENDING_POINTS[1],
-        ]
-
-        TRACK_SIDES[ACTIVE_DOOR].clear()
-        LAST_FOOT_POINT[ACTIVE_DOOR].clear()
-        LAST_COUNT_TIME[ACTIVE_DOOR].clear()
-
-    PENDING_POINTS = []
-    SELECTING_LINE = False
-
-    try:
-        save_config()
-        print(f"[OK] Garis {DOORS[ACTIVE_DOOR]['name']} berhasil dipasang.")
-
-    except Exception as error:
-        print("[ERROR] Gagal menyimpan garis:", error)
-
-
-# ============================================================
-# 10. MODEL, THREAD CAPTURE, DAN THREAD INFERENSI
-# ============================================================
-
-
-def load_model(device_hint=None, use_openvino=USE_OPENVINO):
-    """
-    Muat satu instance model YOLO. Prioritas:
-    1. OpenVINO (export otomatis sekali kalau belum ada)
-    2. Model .pt biasa (fallback kalau OpenVINO gagal)
-
-    Tiap kamera memakai instance sendiri supaya tracker (persist=True)
-    tidak tercampur antar kamera. device_hint dipakai instance kedua
-    supaya tes iGPU tidak diulang.
-    """
-
-    model_path = Path(MODEL_PATH)
-
-    if use_openvino and model_path.suffix == ".pt":
-        openvino_dir = model_path.with_name(
-            f"{model_path.stem}_openvino_model"
-        )
-
-        try:
-            if not openvino_dir.exists():
-                print(
-                    "[MODEL] Export OpenVINO pertama kali "
-                    "(sekali saja, bisa 1-2 menit)..."
-                )
-
-                YOLO(MODEL_PATH).export(
-                    format="openvino",
-                    imgsz=IMGSZ,
-                    half=False,
-                )
-
-            device = device_hint or INFERENCE_DEVICE
-
-            if device == "intel:gpu" and device_hint is None:
-                # Tes iGPU dengan instance terpisah (dibuang setelah tes),
-                # supaya model utama / tracker tidak terpengaruh.
-                try:
-                    probe = YOLO(str(openvino_dir), task="detect")
-
-                    probe.predict(
-                        np.zeros((IMGSZ, IMGSZ, 3), dtype="uint8"),
-                        imgsz=IMGSZ,
-                        device=device,
-                        verbose=False,
-                    )
-
-                    del probe
-
-                except Exception as error:
-                    print("[MODEL] iGPU tidak bisa dipakai, pakai CPU:", error)
-                    device = "intel:cpu"
-
-            model = YOLO(str(openvino_dir), task="detect")
-
-            print(f"[MODEL] Backend OpenVINO ({device}): {openvino_dir}")
-
-            return model, device
-
-        except Exception as error:
-            print("[MODEL] OpenVINO gagal, pakai .pt:", error)
-            print("[MODEL] Pasang dengan: pip install openvino")
-
-    print(f"[MODEL] Backend PyTorch: {MODEL_PATH}")
-
-    return YOLO(MODEL_PATH), None
 
 
 def open_capture(url):
-    """Buka RTSP dengan batas waktu supaya tidak menggantung."""
-
     try:
         cap = cv2.VideoCapture(
-            url,
-            cv2.CAP_FFMPEG,
-            [
-                cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, CAPTURE_TIMEOUT_MS,
-                cv2.CAP_PROP_READ_TIMEOUT_MSEC, CAPTURE_TIMEOUT_MS,
-            ],
+            url, cv2.CAP_FFMPEG,
+            [cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, CAPTURE_TIMEOUT_MS,
+             cv2.CAP_PROP_READ_TIMEOUT_MSEC, CAPTURE_TIMEOUT_MS],
         )
-
     except Exception:
-        # OpenCV lama tanpa parameter timeout.
         cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
 
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-
     return cap
 
 
 def capture_worker(cam):
-    """
-    Thread penerima frame satu kamera.
-
-    Frame selalu ditarik (grab) supaya buffer RTSP terkuras dan gambar
-    tidak tertinggal, tapi konversi warna + resize (retrieve) hanya
-    dilakukan kalau YOLO sedang menganggur dan jeda minimum sudah lewat.
-    """
+    """Selalu grab (kuras buffer), retrieve hanya kalau face thread siap."""
 
     cap = None
-
-    publish_interval = 1.0 / max(1, INFERENCE_MAX_FPS)
-    next_publish = 0.0
 
     while not STOP_EVENT.is_set():
         try:
@@ -1743,41 +341,23 @@ def capture_worker(cam):
                 if not cap.isOpened():
                     cam.camera_ok = False
                     cam.last_error = "RTSP belum tersambung"
-
                     time.sleep(RECONNECT_DELAY)
                     continue
 
             if not cap.grab():
                 ok, frame = False, None
 
-            elif (
-                not cam.want_frame.is_set()
-                or time.monotonic() < next_publish
-            ):
-                # YOLO masih sibuk atau terlalu cepat: buang frame ini
-                # tanpa konversi warna / resize.
+            elif not cam.want_frame.is_set():
                 cam.camera_ok = True
-                cam.last_error = ""
                 continue
 
             else:
                 ok, frame = cap.retrieve()
 
-                now = time.monotonic()
-                next_publish += publish_interval
-
-                # Kalau tertinggal (YOLO lebih lambat dari batas FPS atau
-                # setelah reconnect), jangan mengejar.
-                if next_publish < now:
-                    next_publish = now
-
             if not ok or frame is None or frame.size == 0:
                 cam.camera_ok = False
-                cam.last_error = "Frame CCTV kosong; mencoba reconnect"
-
-                if cap is not None:
-                    cap.release()
-
+                cam.last_error = "Frame kosong; reconnect"
+                cap.release()
                 cap = None
                 time.sleep(RECONNECT_DELAY)
                 continue
@@ -1785,23 +365,10 @@ def capture_worker(cam):
             cam.camera_ok = True
             cam.last_error = ""
 
-            # Kecilkan sekali di sini. Semua bagian lain
-            # (YOLO, kotak, dashboard) memakai versi kecil ini.
-            h, w = frame.shape[:2]
-            scale = min(DISPLAY_WIDTH / w, DISPLAY_HEIGHT / h)
-
-            if scale < 1.0:
-                frame = cv2.resize(
-                    frame,
-                    (int(w * scale), int(h * scale)),
-                    interpolation=cv2.INTER_AREA,
-                )
-
             with cam.lock:
                 cam.frame = frame
                 cam.frame_id += 1
 
-            # Satu frame dalam proses sekali waktu.
             cam.want_frame.clear()
             cam.new_frame.set()
 
@@ -1819,28 +386,24 @@ def capture_worker(cam):
         cap.release()
 
 
-def inference_worker(cam, model, inference_device):
-    """Thread YOLO + ByteTrack satu kamera."""
+# ============================================================
+# 6. THREAD FACE RECOGNITION
+# ============================================================
 
-    camera_id = cam.id
-    camera_label = CAMERAS[camera_id]["label"]
-    people = TRACKED_PEOPLE[camera_id]
-    stats = TRACK_STATS[camera_id]
-    door_ids = doors_of_camera(camera_id)
+def face_worker(cam, app, db):
+    det_model = app.models["detection"]
+    rec_model = app.models["recognition"]
 
-    # Face recognition hanya berjalan di satu kamera (FACE_CAMERA_ID).
-    use_face = camera_id == FACE_CAMERA_ID
-
-    previous_time = time.monotonic()
+    tracker = FaceTracker()
+    last_logged = {}
+    previous = time.monotonic()
 
     while not STOP_EVENT.is_set():
-        # Tunggu frame baru tanpa polling.
         if not cam.new_frame.wait(timeout=0.5):
             continue
 
         cam.new_frame.clear()
 
-        # Frame hanya dibaca (tidak dimodifikasi), jadi tidak perlu copy.
         with cam.lock:
             frame = cam.frame
             frame_id = cam.frame_id
@@ -1849,166 +412,111 @@ def inference_worker(cam, model, inference_device):
             cam.want_frame.set()
             continue
 
-        detections = []
-        face_candidates = []
+        faces_out = []
 
         try:
-            results = model.track(
-                frame,
-                persist=True,
-                classes=[PERSON_CLASS_ID],
-                conf=CONFIDENCE,
-                imgsz=IMGSZ,
-                tracker=TRACKER_CONFIG,
-                device=inference_device,
-                verbose=False,
-            )
-
-            if results:
-                result = results[0]
-
-                if result.boxes is not None and result.boxes.id is not None:
-                    boxes = result.boxes.xyxy.cpu().numpy()
-                    track_ids = result.boxes.id.int().cpu().tolist()
-                    confidences = (
-                        result.boxes.conf.cpu().numpy().tolist()
-                        if result.boxes.conf is not None
-                        else [None] * len(track_ids)
-                    )
-
-                    stamp = time.monotonic()
-
-                    for box, track_id, confidence in zip(boxes, track_ids, confidences):
-                        x1, y1, x2, y2 = map(int, box)
-
-                        # Identitas + kotak wajah dibaca dari FaceWorker
-                        # (thread terpisah, tidak menghambat YOLO).
-                        face_name = None
-                        face_box = None
-
-                        if use_face and FACE_WORKER is not None:
-                            person_box = (x1, y1, x2, y2)
-
-                            face_name = FACE_MATCHER.get_identity(track_id)
-                            face_box = FACE_WORKER.get_face_box(
-                                track_id, person_box
-                            )
-                            face_candidates.append((track_id, person_box))
-
-                        # Titik kaki menjadi titik referensi.
-                        foot_point = ((x1 + x2) // 2, y2)
-                        is_new_track = track_id not in people
-                        previous = people.get(track_id, {})
-
-                        people[track_id] = {
-                            "first_seen": previous.get("first_seen", stamp),
-                            "last_seen": stamp,
-                            "point": foot_point,
-                            "box": (x1, y1, x2, y2),
-                            "confidence": round(float(confidence), 4) if confidence is not None else "",
-                            "area": previous.get("area", "BELUM DIKETAHUI"),
-                        }
-
-                        if is_new_track:
-                            stats["new"] += 1
-
-                            # Simpan NEW TRACK ke CSV saja.
-                            # Tidak perlu mencetak ke terminal.
-                            write_track_log(
-                                camera_label,
-                                "NEW_TRACK",
-                                track_id,
-                                people[track_id],
-                            )
-
-                        # Periksa garis virtual milik kamera ini saja.
-                        for door_id in door_ids:
-                            process_crossing(
-                                door_id,
-                                track_id,
-                                foot_point,
-                            )
-
-                        detections.append(
-                            {
-                                "box": (x1, y1, x2, y2),
-                                "id": track_id,
-                                "foot": foot_point,
-                                "name": face_name,
-                                "face_box": face_box,
-                            }
-                        )
-
-            # Serahkan orang yang belum dikenali ke FaceWorker.
-            # Cepat: hanya menyaring + memasukkan ke antrean 1 slot.
-            if FACE_WORKER is not None and face_candidates:
-                FACE_WORKER.submit(
-                    frame,
-                    FACE_WORKER.due_targets(face_candidates),
-                )
-
-            # Bersihkan state ID yang sudah lama hilang.
+            t0 = time.perf_counter()
+            bboxes, kpss = det_model.detect(frame, max_num=0, metric="default")
+            cam.t_det = 0.9 * cam.t_det + 0.1 * (time.perf_counter() - t0)
             stamp = time.monotonic()
 
-            expired_ids = [
-                track_id
-                for track_id, data in people.items()
-                if stamp - data["last_seen"] > MAX_TRACK_LOST_SECONDS
-            ]
+            boxes, dets = [], []
+            for i in range(bboxes.shape[0]):
+                x1, y1, x2, y2 = [int(v) for v in bboxes[i, :4]]
 
-            if expired_ids:
-                removed = []
+                if min(x2 - x1, y2 - y1) < MIN_FACE_SIZE:
+                    continue
+                if kpss is None:
+                    continue
 
-                with STATE_LOCK:
-                    for track_id in expired_ids:
-                        lost_data = people.pop(track_id, None) or {}
-                        stats["lost"] += 1
-                        removed.append((track_id, lost_data))
+                boxes.append((x1, y1, x2, y2))
+                dets.append((bboxes[i, :4], kpss[i], float(bboxes[i, 4])))
 
-                        for door_id in door_ids:
-                            TRACK_SIDES[door_id].pop(track_id, None)
-                            LAST_FOOT_POINT[door_id].pop(track_id, None)
-                            LAST_COUNT_TIME[door_id].pop(track_id, None)
+            tracks = tracker.update(boxes, stamp)
 
-                        if use_face and FACE_WORKER is not None:
-                            FACE_WORKER.forget(track_id)
+            for track, (bbox, kps, score) in zip(tracks, dets):
+                interval = (
+                    EMBED_MIN_INTERVAL if track.name is None else RECHECK_INTERVAL
+                )
+                needs_check = stamp - track.last_verified >= interval
 
-                # Print dan catat CSV di luar lock.
-                for track_id, lost_data in removed:
-                    duration = max(0.0, stamp - lost_data.get("first_seen", stamp))
+                if needs_check:
+                    face = Face(bbox=bbox, kps=kps, det_score=score)
 
-                    print(
-                        f"[TRACK LOST] {datetime.now().strftime('%H:%M:%S')} | "
-                        f"{camera_label} | ID={track_id} | "
-                        f"LAST AREA={lost_data.get('area', 'BELUM DIKETAHUI')} | "
-                        f"DURATION={duration:.1f}s"
-                    )
-                    write_track_log(
-                        camera_label,
-                        "TRACK_LOST",
-                        track_id,
-                        lost_data,
-                        duration=round(duration, 1),
+                    t0 = time.perf_counter()
+                    emb = rec_model.get(frame, face)
+                    cam.t_emb = 0.9 * cam.t_emb + 0.1 * (time.perf_counter() - t0)
+
+                    name, sim, margin = db.match(emb)
+                    matched = (
+                        name
+                        if sim >= SIMILARITY_THRESHOLD and margin >= MIN_MARGIN
+                        else None
                     )
 
-            print_track_summary(cam, stamp)
+                    track.last_verified = stamp
+                    track.best = name
+                    track.sim_last = sim
 
-            current_time = time.monotonic()
-            elapsed = current_time - previous_time
+                    if track.name is None:
+                        track.votes.append(matched)
+                        counts = Counter(v for v in track.votes if v)
 
+                        if counts:
+                            top, n = counts.most_common(1)[0]
+
+                            if n >= MIN_CONFIRMATIONS:
+                                track.name = top
+                                track.similarity = sim
+                                track.mismatch = 0
+                                track.last_verified = stamp + random.uniform(0.0, 1.0)
+
+                                if stamp - last_logged.get(top, -1e9) >= LOG_COOLDOWN:
+                                    last_logged[top] = stamp
+                                    print(
+                                        f"[FACE RECOGNIZED] {datetime.now():%H:%M:%S} | "
+                                        f"{CAMERA_LABEL} | ID={track.id} | NAME={top} "
+                                        f"| SIM={sim:.2f}"
+                                    )
+                                    write_face_log(track.id, top)
+
+                    else:
+                        if matched == track.name:
+                            track.mismatch = 0
+                            track.similarity = sim
+                        elif matched is not None:
+                            track.mismatch += 1
+
+                            if track.mismatch >= RECHECK_MISMATCH_LIMIT:
+                                track.name = None
+                                track.votes.clear()
+                                track.votes.append(matched)
+                                track.mismatch = 0
+
+                faces_out.append(
+                    {
+                        "box": track.box,
+                        "id": track.id,
+                        "name": track.name,
+                        "sim": track.sim_last,
+                        "best": track.best,
+                        "det": score,
+                    }
+                )
+
+            cam.faces_in_frame = len(faces_out)
+
+            now = time.monotonic()
+            elapsed = now - previous
             if elapsed > 0:
                 cam.fps = 0.9 * cam.fps + 0.1 * (1.0 / elapsed)
+            previous = now
 
-            previous_time = current_time
-
-            # Simpan frame + hasilnya sebagai satu pasangan (daftar kosong
-            # kalau tidak ada orang, supaya kotak lama tidak tertinggal).
             with cam.lock:
-                cam.result = (frame_id, frame, detections)
+                cam.result = (frame_id, frame, faces_out)
 
         except Exception as error:
-            cam.last_error = f"Inferensi YOLO: {error}"
-
+            cam.last_error = f"Face: {error}"
             print("[ERROR]", cam.last_error)
 
             with cam.lock:
@@ -2017,496 +525,183 @@ def inference_worker(cam, model, inference_device):
             time.sleep(0.2)
 
         finally:
-            # Beri tahu capture: siap menerima frame berikutnya.
             cam.want_frame.set()
 
 
-def load_camera_urls():
-    """Membaca konfigurasi CCTV Office dari cameras.json."""
+# ============================================================
+# 7. TAMPILAN
+# ============================================================
 
-    if not CAMERA_CONFIG_FILE.exists():
-        raise FileNotFoundError(
-            f"File konfigurasi CCTV tidak ditemukan: {CAMERA_CONFIG_FILE}"
+def render(cam, view, det_size):
+    _, raw, faces = view
+
+    if raw is None:
+        frame = np.zeros((360, 640, 3), dtype="uint8")
+        cv2.putText(frame, "MENUNGGU CCTV...", (30, 50),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 255), 1)
+        return frame
+
+    frame = raw.copy()
+    scale = max(0.6, frame.shape[1] / 1280)
+    thick = max(2, int(round(2 * scale)))
+
+    for f in faces:
+        x1, y1, x2, y2 = f["box"]
+        known = f["name"] is not None
+        color = (0, 255, 255) if known else (0, 255, 0)
+
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, thick)
+
+        label = (
+            f"{f['name']} {f['sim']:.2f}" if known
+            else f"? {f['best']} {f['sim']:.2f}"
         )
+        cv2.putText(frame, label, (x1, max(18, y1 - 8)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6 * scale, color, thick,
+                    cv2.LINE_AA)
 
-    with open(CAMERA_CONFIG_FILE, "r", encoding="utf-8") as file:
-        config = json.load(file)
+    header = (
+        f"FACE ONLY | FPS {cam.fps:.0f} | wajah {cam.faces_in_frame} | "
+        f"det {det_size[0]} | thr {SIMILARITY_THRESHOLD:.2f}"
+        f"det {cam.t_det*1000:.0f}ms emb {cam.t_emb*1000:.0f}ms | "
+    )
+    cv2.putText(frame, header, (10, int(26 * scale)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7 * scale, (255, 255, 255),
+                thick, cv2.LINE_AA)
 
-    # Ambil kelompok OFFICE.
-    office_config = config.get("OFFICE", config)
+    if not cam.camera_ok:
+        cv2.putText(frame, "CAMERA RECONNECTING", (10, int(58 * scale)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6 * scale, (0, 0, 255), 2)
+    elif cam.last_error:
+        cv2.putText(frame, cam.last_error[:80], (10, int(58 * scale)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5 * scale, (0, 0, 255), 1)
 
-    urls = {}
+    if frame.shape[1] > PANEL_WIDTH:
+        h = int(frame.shape[0] * PANEL_WIDTH / frame.shape[1])
+        frame = cv2.resize(frame, (PANEL_WIDTH, h), interpolation=cv2.INTER_AREA)
 
-    for camera_id in CAMERAS:
-        if camera_id not in office_config:
-            raise ValueError(
-                f"Konfigurasi OFFICE.{camera_id} "
-                f"tidak ditemukan di cameras.json"
-            )
-
-        camera = office_config[camera_id]
-
-        ip = camera["ip"]
-        username = quote(str(camera["username"]), safe="")
-        password = quote(str(camera["password"]), safe="")
-        port = int(camera.get("port", 554))
-        channel = camera.get("channel", "101")
-
-        urls[camera_id] = (
-            f"rtsp://{username}:{password}@{ip}:{port}"
-            f"/Streaming/Channels/{channel}"
-        )
-
-    return urls
+    return frame
 
 
 # ============================================================
-# 11. PROGRAM UTAMA
+# 8. PROGRAM UTAMA
 # ============================================================
 
+def prepare_app(det_size):
+    providers = (
+        ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        if GPU_ID >= 0 else ["CPUExecutionProvider"]
+    )
+
+    app = FaceAnalysis(name=MODEL_PACK, providers=providers,
+                       allowed_modules=["detection", "recognition"])
+    app.prepare(ctx_id=GPU_ID, det_size=det_size, det_thresh=DET_THRESH)
+    print("[INFO] Provider deteksi:", app.models["detection"].session.get_providers())
+    return app
 
 def main():
-    global ACTIVE_DOOR, SELECTING_LINE
-    global PENDING_POINTS
-    global INPUT_MODE, INPUT_BUFFER
-    global CANVAS_WIDTH, CANVAS_HEIGHT
-    global FACE_ENGINE, FACE_MATCHER, FACE_WORKER
+    global SIMILARITY_THRESHOLD, DET_SIZE_INDEX
 
     try:
-        urls = load_camera_urls()
-        print("[CAMERA] Konfigurasi CCTV berhasil dimuat.")
-
+        url = load_camera_url()
     except Exception as error:
         print("[ERROR] Gagal membaca konfigurasi CCTV:", error)
         return
 
-    print("=" * 60)
-    print("LOBBY PEOPLE TRACKING - STABLE (DUAL CCTV)")
-    print(f"{len(CAMERAS)} CCTV | {len(DOORS)} PINTU | YOLO + ByteTrack")
-    print(f"YOLO IMGSZ: {IMGSZ} | FPS maks per kamera: {INFERENCE_MAX_FPS}")
-    print(f"Tracker: {TRACKER_CONFIG}")
-    print("=" * 60)
-
-    if not Path(TRACKER_CONFIG).exists():
-        print(f"[ERROR] File tracker tidak ditemukan: {TRACKER_CONFIG}")
-        print(
-            "Simpan custom_bytetrack_stable.yaml "
-            "di folder yang sama dengan script."
-        )
+    try:
+        db = FaceDatabase(FACE_DATABASE)
+    except Exception as error:
+        print("[ERROR] Gagal memuat database wajah:", error)
         return
 
-    # Satu instance model per kamera supaya tracker tidak tercampur.
-    models = {}
-    inference_device = None
-
     try:
-        for index, camera_id in enumerate(CAMERAS):
-            if index == 0:
-                model, inference_device = load_model()
-            else:
-                model, _ = load_model(
-                    device_hint=inference_device,
-                    use_openvino=inference_device is not None,
-                )
-
-            models[camera_id] = model
-
+        app = prepare_app(DET_SIZES[DET_SIZE_INDEX])
     except Exception as error:
-        print("[ERROR] Gagal memuat model YOLO:", error)
+        print("[ERROR] Gagal memuat InsightFace:", error)
         return
 
-    # --------------------------------------------------------
-    # INISIALISASI FACE RECOGNITION
-    # --------------------------------------------------------
+    print("=" * 60)
+    print("FACE RECOGNITION ONLY (tanpa YOLO)")
+    print(f"Model: {MODEL_PACK} | det_size: {DET_SIZES[DET_SIZE_INDEX]} | "
+          f"threshold: {SIMILARITY_THRESHOLD}")
+    print("=" * 60)
 
-    try:
-        print("[FACE] Memuat Face Recognition...")
+    cam = CameraState(url)
 
-        FACE_ENGINE = FaceEngine(
-            det_size=(640, 640),
-            det_thresh=0.35,
-        )
+    threads = [
+        threading.Thread(target=capture_worker, args=(cam,), daemon=True),
+        threading.Thread(target=face_worker, args=(cam, app, db), daemon=True),
+    ]
+    for t in threads:
+        t.start()
 
-        FACE_MATCHER = FaceMatcher(
-            database_path=FACE_DATABASE,
-            threshold=FACE_SIMILARITY_THRESHOLD,
-            min_confirmations=FACE_MIN_CONFIRMATIONS,
-        )
-
-        face_label = CAMERAS[FACE_CAMERA_ID]["label"]
-
-        def on_face_recognized(track_id, name):
-            print(
-                f"[FACE RECOGNIZED] {datetime.now().strftime('%H:%M:%S')} | "
-                f"{face_label} | ID={track_id} | NAME={name}"
-            )
-            write_face_log(face_label, track_id, name)
-
-        FACE_WORKER = FaceWorker(
-            FACE_ENGINE,
-            FACE_MATCHER,
-            on_recognized=on_face_recognized,
-            stop_event=STOP_EVENT,
-
-            # Filter deteksi wajah
-            min_size=12,
-            min_score=0.35,
-
-            # Nonaktifkan filter sementara untuk pengujian
-            max_yaw=0.0,
-            min_sharpness=0.0,
-
-            debug=True,
-        )
-        FACE_WORKER.start()
-
-        print("[FACE] Face Recognition aktif di LANTAI1")
-
-    except Exception as error:
-        print("[FACE ERROR] Gagal menginisialisasi Face Recognition:", error)
-        FACE_ENGINE = None
-        FACE_MATCHER = None
-        FACE_WORKER = None
-
-    cameras = {
-        camera_id: CameraState(camera_id, urls[camera_id])
-        for camera_id in CAMERAS
-    }
-
-    # --------------------------------------------------------
-    # JALANKAN THREAD
-    # --------------------------------------------------------
-
-    log_thread = threading.Thread(target=log_writer_worker, daemon=True)
-    log_thread.start()
-
-    threads = []
-
-    for camera_id, cam in cameras.items():
-        threads.append(
-            threading.Thread(target=capture_worker, args=(cam,), daemon=True)
-        )
-        threads.append(
-            threading.Thread(
-                target=inference_worker,
-                args=(cam, models[camera_id], inference_device),
-                daemon=True,
-            )
-        )
-
-    for thread in threads:
-        thread.start()
-
-    # Tunggu frame pertama dari semua CCTV.
-    wait_start = time.monotonic()
-
-    while time.monotonic() - wait_start < FIRST_FRAME_TIMEOUT:
-        if all(cam.frame is not None for cam in cameras.values()):
-            break
-
+    start = time.monotonic()
+    while time.monotonic() - start < FIRST_FRAME_TIMEOUT and cam.frame is None:
         time.sleep(0.1)
 
-    missing_cameras = [
-        CAMERAS[camera_id]["title"]
-        for camera_id, cam in cameras.items()
-        if cam.frame is None
-    ]
-
-    if missing_cameras:
+    if cam.frame is None:
         STOP_EVENT.set()
-        LOG_STOP.set()
-        print(
-            f"[ERROR] CCTV tidak mengirim frame dalam "
-            f"{FIRST_FRAME_TIMEOUT:.0f} detik: {', '.join(missing_cameras)}"
-        )
+        print(f"[ERROR] CCTV tidak mengirim frame dalam {FIRST_FRAME_TIMEOUT:.0f} detik")
         return
 
-    # Ukuran kerja tiap kamera + tata letak panel dalam grid (COLUMNS kolom).
-    sizes = {}
-
-    for camera_id, cam in cameras.items():
-        with cam.lock:
-            frame_height, frame_width = cam.frame.shape[:2]
-
-        FRAME_SIZES[camera_id] = (frame_width, frame_height)
-
-        scale = min(
-            PANEL_WIDTH / frame_width,
-            PANEL_HEIGHT / frame_height,
-            1.0,
-        )
-
-        sizes[camera_id] = (
-            int(frame_width * scale),
-            int(frame_height * scale),
-        )
-
-    cell_w = max(width for width, _ in sizes.values())
-    cell_h = max(height for _, height in sizes.values())
-
-    for index, camera_id in enumerate(cameras):
-        view_width, view_height = sizes[camera_id]
-
-        VIEWS[camera_id] = {
-            "x": (index % COLUMNS) * cell_w,
-            "y": (index // COLUMNS) * cell_h,
-            "w": view_width,
-            "h": view_height,
-        }
-
-    CANVAS_WIDTH = cell_w * min(COLUMNS, len(cameras))
-    CANVAS_HEIGHT = cell_h * math.ceil(len(cameras) / COLUMNS)
-
-    load_config()
-    load_state()
-
-    last_state_save = time.monotonic()
-    last_reset_date = datetime.now().strftime("%Y-%m-%d")
-
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(WINDOW_NAME, CANVAS_WIDTH, CANVAS_HEIGHT)
-    cv2.setMouseCallback(WINDOW_NAME, mouse_callback)
 
-    print()
-    print("KONTROL:")
-    print("1 = Atur garis PINTU KELUAR       (panel LANTAI 1)")
-    print("2 = Atur garis AREA PRODUKSI      (panel LANTAI 1)")
-    print("3 = Atur garis OFFICE LANTAI 1    (panel LANTAI 1)")
-    print("4 = Atur garis TANGGA             (panel LANTAI 2)")
-    print("5 = Atur garis OFFICE LANTAI 2    (panel LANTAI 2)")
-    print("6 = Atur garis RUANG MEETING 2  (panel CCTV LANTAI 2)")
-    print("7 = Atur garis RUANG MEETING 1  (panel CCTV2 LANTAI 2)")
-    print("R = Balik arah IN/OUT pintu terpilih")
-    print("S = Simpan konfigurasi garis")
-    print("+ / - = Koreksi okupansi Lobby (+1 / -1)")
-    print("K = Isi okupansi Lobby manual (ketik angka di jendela, Enter simpan, Esc batal)")
-    print("X = Reset hitungan crossing dan okupansi area")
-    print("Q = Keluar")
-    print("Klik jendela CCTV terlebih dahulu sebelum menekan tombol.")
-    print("Garis tangga: IN = naik (Lobby -> Lantai 2), OUT = turun (Lantai 2 -> Lobby).")
-    print()
+    print("KONTROL: Q keluar | [ / ] threshold -/+ 0.02 | D ganti ukuran deteksi")
 
-    # --------------------------------------------------------
-    # LOOP TAMPILAN
-    # --------------------------------------------------------
-
-    # Panel digambar ulang hanya kalau isinya berubah (hasil AI baru,
-    # hitungan berubah, garis diubah, dsb.). Selain itu canvas lama dipakai.
-    panel_cache = {}
-    canvas = None
+    last_id = -1
+    shown = None
 
     try:
         while True:
             loop_start = time.perf_counter()
+            view = cam.get_view()
 
-            # Auto-reset harian dan simpan state berkala.
-            now_dt = datetime.now()
-            today = now_dt.strftime("%Y-%m-%d")
-
-            if (
-                AUTO_RESET_HOUR is not None
-                and today != last_reset_date
-                and now_dt.hour >= AUTO_RESET_HOUR
-            ):
-                reset_counts("auto-reset harian")
-                last_reset_date = today
-                last_state_save = time.monotonic()
-
-            if time.monotonic() - last_state_save > STATE_SAVE_INTERVAL:
-                request_save()
-                last_state_save = time.monotonic()
-
-            snapshot = get_snapshot()
-            state_key = make_state_key(snapshot)
-
-            selecting_key = (
-                (ACTIVE_DOOR, tuple(PENDING_POINTS)) if SELECTING_LINE else None
-            )
-
-            fps_text = "/".join(
-                f"{cameras[camera_id].fps:.0f}" for camera_id in CAMERAS
-            )
-
-            changed = canvas is None
-
-            for camera_id, cam in cameras.items():
-                view_data = cam.get_view_data()
-
-                key = (
-                    view_data[0],
-                    state_key,
-                    selecting_key,
-                    fps_text,
-                    cam.camera_ok,
-                    cam.last_error,
-                )
-
-                cached = panel_cache.get(camera_id)
-
-                if cached is not None and cached[0] == key:
-                    continue
-
-                panel = render_camera(cam, view_data, fps_text, snapshot)
-                view = VIEWS[camera_id]
-
-                if panel.shape[1] != view["w"] or panel.shape[0] != view["h"]:
-                    panel = cv2.resize(
-                        panel,
-                        (view["w"], view["h"]),
-                        interpolation=cv2.INTER_AREA,
-                    )
-
-                panel_cache[camera_id] = (key, panel)
-                changed = True
-
-            if changed:
-                canvas = np.zeros(
-                    (CANVAS_HEIGHT, CANVAS_WIDTH, 3), dtype="uint8"
-                )
-
-                for camera_id in cameras:
-                    view = VIEWS[camera_id]
-                    panel = panel_cache[camera_id][1]
-
-                    canvas[
-                        view["y"]:view["y"] + view["h"],
-                        view["x"]:view["x"] + view["w"],
-                    ] = panel
-
-                    # Garis pemisah antar panel.
-                    if view["x"] > 0:
-                        cv2.line(
-                            canvas,
-                            (view["x"], view["y"]),
-                            (view["x"], view["y"] + view["h"]),
-                            (90, 90, 90),
-                            1,
-                        )
-
-                    if view["y"] > 0:
-                        cv2.line(
-                            canvas,
-                            (view["x"], view["y"]),
-                            (view["x"] + view["w"], view["y"]),
-                            (90, 90, 90),
-                            1,
-                        )
-
-            if INPUT_MODE:
-                shown = canvas.copy()
-                draw_input_prompt(shown)
-            else:
-                shown = canvas
+            if view[0] != last_id or shown is None:
+                shown = render(cam, view, DET_SIZES[DET_SIZE_INDEX])
+                last_id = view[0]
 
             cv2.imshow(WINDOW_NAME, shown)
 
-            # Batasi FPS tampilan supaya loop tidak berputar tanpa henti.
             spare = 1.0 / UI_FPS - (time.perf_counter() - loop_start)
             key = cv2.waitKey(max(1, int(spare * 1000))) & 0xFF
 
-            # Jendela ditutup lewat tombol X.
             if cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
                 break
 
-            if INPUT_MODE:
-                # Selama mode input, semua tombol masuk ke kotak ketik.
-                if ord("0") <= key <= ord("9"):
-                    if len(INPUT_BUFFER) < 3:
-                        INPUT_BUFFER += chr(key)
-
-                elif key in (8, 127):  # Backspace
-                    INPUT_BUFFER = INPUT_BUFFER[:-1]
-
-                elif key in (13, 10):  # Enter
-                    if INPUT_BUFFER:
-                        set_area("Lobby", int(INPUT_BUFFER))
-                    else:
-                        print("[INFO] Input kosong, dibatalkan.")
-
-                    INPUT_MODE = False
-                    INPUT_BUFFER = ""
-
-                elif key == 27:  # Esc
-                    INPUT_MODE = False
-                    INPUT_BUFFER = ""
-                    print("[INFO] Input okupansi dibatalkan.")
-
-            elif ord("1") <= key <= ord("0") + len(DOORS):
-
-                ACTIVE_DOOR = int(chr(key))
-                SELECTING_LINE = True
-                PENDING_POINTS = []
-
-                print(
-                    f"[CONFIG] Pilih dua titik untuk "
-                    f"{DOORS[ACTIVE_DOOR]['name']} di panel "
-                    f"{CAMERAS[DOORS[ACTIVE_DOOR]['camera']]['title']}."
-                )
-
-            elif key in (ord("r"), ord("R")):
-                with STATE_LOCK:
-                    DOORS[ACTIVE_DOOR]["reverse"] = (
-                        not DOORS[ACTIVE_DOOR]["reverse"]
-                    )
-
-                    TRACK_SIDES[ACTIVE_DOOR].clear()
-                    LAST_FOOT_POINT[ACTIVE_DOOR].clear()
-
-                save_config()
-
-                print(f"[CONFIG] Arah {DOORS[ACTIVE_DOOR]['name']} dibalik.")
-
-            elif key in (ord("s"), ord("S")):
-                save_config()
-
-            elif key in (ord("+"), ord("=")):
-                adjust_area("Lobby", +1)
-
-            elif key == ord("-"):
-                adjust_area("Lobby", -1)
-
-            elif key in (ord("k"), ord("K")):
-                INPUT_MODE = True
-                INPUT_BUFFER = ""
-                SELECTING_LINE = False
-                PENDING_POINTS = []
-
-            elif key in (ord("x"), ord("X")):
-                reset_counts("manual")
-
-            elif key in (ord("q"), ord("Q")):
+            if key in (ord("q"), ord("Q")):
                 break
 
-    except KeyboardInterrupt:
-        print("[INFO] Program dihentikan dari keyboard.")
+            elif key == ord("["):
+                SIMILARITY_THRESHOLD = max(0.20, SIMILARITY_THRESHOLD - 0.02)
+                last_id = -1
+                print(f"[CONFIG] Threshold {SIMILARITY_THRESHOLD:.2f}")
 
-    except Exception as error:
-        print("[FATAL ERROR]", repr(error))
+            elif key == ord("]"):
+                SIMILARITY_THRESHOLD = min(0.90, SIMILARITY_THRESHOLD + 0.02)
+                last_id = -1
+                print(f"[CONFIG] Threshold {SIMILARITY_THRESHOLD:.2f}")
+
+            elif key in (ord("d"), ord("D")):
+                DET_SIZE_INDEX = (DET_SIZE_INDEX + 1) % len(DET_SIZES)
+                size = DET_SIZES[DET_SIZE_INDEX]
+
+                # Ganti ukuran deteksi tanpa memuat ulang model.
+                app.det_model.input_size = size
+                last_id = -1
+                print(f"[CONFIG] Ukuran deteksi wajah {size}")
+
+    except KeyboardInterrupt:
+        print("[INFO] Dihentikan dari keyboard.")
 
     finally:
         STOP_EVENT.set()
 
-        for thread in threads:
-            thread.join(timeout=3)
-
-        if FACE_WORKER is not None:
-            FACE_WORKER.join(timeout=3)
-
-        # Thread penulis berhenti terakhir supaya sisa log sempat ditulis.
-        LOG_STOP.set()
-        log_thread.join(timeout=5)
-
-        # Simpan state terakhir supaya restart tidak mulai dari 0.
-        save_state()
+        for t in threads:
+            t.join(timeout=3)
 
         cv2.destroyAllWindows()
+        print("[INFO] Face recognition dihentikan.")
 
-        print("[INFO] People tracking dihentikan.")
-
-
-# ============================================================
-# 12. ENTRY POINT
-# ============================================================
 
 if __name__ == "__main__":
     main()
